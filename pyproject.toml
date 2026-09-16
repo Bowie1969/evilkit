@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "evilkit"
+dynamic = ["version"]
+description = "Scope-gated launcher for the Kimi Code CLI."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+keywords = ["kimi", "cli", "launcher", "scope", "pentest"]
+classifiers = [
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Operating System :: POSIX :: Linux",
+  "Operating System :: MacOS",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/Bowie1969/evilkit"
+Issues = "https://github.com/Bowie1969/evilkit/issues"
+
+[project.scripts]
+evilkit = "evilkit.cli:main"
+
+[tool.hatch.version]
+path = "evilkit/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["evilkit"]

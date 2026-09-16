@@ -215,6 +215,192 @@ class TestScopeCommand(CliTestCase):
         self.assertEqual(path.read_bytes(), before)
 
 
+class TestScopeEdit(CliTestCase):
+    """`scope set` / `add` / `remove` — changing the record without launching."""
+
+    def test_set_replaces_the_recorded_scope(self):
+        path = self.write_mcp_json(self.pentest_fixture("10.0.0.0/24"))
+        code, out, err = self.call_main(["scope", "set", "10.8.0.0/16"])
+        self.assertEqual(code, EXIT_OK)
+        self.assertEqual(err, "")
+        self.assertIn("10.8.0.0/16", out)
+        self.assertEqual(self.scope_in(path), "10.8.0.0/16")
+        self.assertEqual(len(self.backups()), 1)
+
+    def test_set_writes_the_normalised_form(self):
+        path = self.write_mcp_json(self.pentest_fixture("10.0.0.0/24"))
+        code, _, _ = self.call_main(["scope", "set", "10.0.0.5, app.lan."])
+        self.assertEqual(code, EXIT_OK)
+        self.assertEqual(self.scope_in(path), "10.0.0.5/32,app.lan")
+
+    def test_set_accepts_solo(self):
+        path = self.write_mcp_json(self.pentest_fixture("10.0.0.0/24"))
+        code, _, _ = self.call_main(["scope", "set", "solo"])
+        self.assertEqual(code, EXIT_OK)
+        self.assertEqual(self.scope_in(path), "127.0.0.1/32")
+
+    def test_set_preserves_everything_else_in_the_file(self):
+        path = self.write_mcp_json(self.pentest_fixture("10.0.0.0/24"))
+        self.call_main(["scope", "set", "10.8.0.0/16"])
+        data = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(data["mcpServers"]["pentest"]["env"]["OTHER_ENV"], "keep-me")
+        self.assertEqual(data["mcpServers"]["pentest"]["env"]["NUMERIC"], 7)
+        self.assertEqual(
+            data["mcpServers"]["mission"]["env"][SCOPE_ENV_KEY], "not-the-pentest-server"
+        )
+        self.assertEqual(data["topLevel"]["nested"][2], {"flag": True})
+
+    def test_set_rejects_host_bits_and_writes_nothing(self):
+        path = self.write_mcp_json(self.pentest_fixture("10.0.0.0/24"))
+        before = path.read_bytes()
+        code, _, err = self.call_main(["scope", "set", "10.0.0.5/24"])
+        self.assertEqual(code, EXIT_USAGE)
+        self.assertIn("did you mean 10.0.0.0/24", err)
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(self.backups(), [])
+
+    def test_set_refuses_a_zero_prefix_without_allow_any(self):
+        path = self.write_mcp_json(self.pentest_fixture("10.0.0.0/24"))
+        before = path.read_bytes()
+        code, _, err = self.call_main(["scope", "set", "0.0.0.0/0"])
+        self.assertEqual(code, EXIT_USAGE)
+        self.assertIn("--allow-any", err)
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_set_accepts_a_zero_prefix_with_allow_any(self):
+        path = self.write_mcp_json(self.pentest_fixture("10.0.0.0/24"))
+        code, _, _ = self.call_main(["scope", "set", "0.0.0.0/0", "--allow-any"])
+        self.assertEqual(code, EXIT_OK)
+        self.assertEqual(self.scope_in(path), "0.0.0.0/0")
+
+    def test_set_dry_run_reports_and_writes_nothing(self):
+        path = self.write_mcp_json(self.pentest_fixture("10.0.0.0/24"))
+        before = path.read_bytes()
+        code, out, _ = self.call_main(["scope", "set", "10.8.0.0/16", "--dry-run"])
+        self.assertEqual(code, EXIT_OK)
+        self.assertIn("would record", out)
+        self.assertIn("10.8.0.0/16", out)
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(self.backups(), [])
+
+    def test_set_on_the_same_scope_is_a_no_op(self):
+        path = self.write_mcp_json(self.pentest_fixture("10.0.0.0/24"))
+        before = path.read_bytes()
+        code, out, _ = self.call_main(["scope", "set", "10.0.0.0/24"])
+        self.assertEqual(code, EXIT_OK)
+        self.assertIn("already", out)
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(self.backups(), [])
+
+    def test_set_accepts_an_explicit_path(self):
+        path = self.write_mcp_json(self.pentest_fixture("10.0.0.0/24"))
+        code, _, _ = self.call_main(["scope", "set", "10.8.0.0/16", "--mcp-json", str(path)])
+        self.assertEqual(code, EXIT_OK)
+        self.assertEqual(self.scope_in(path), "10.8.0.0/16")
+
+    def test_set_works_when_the_server_has_no_env_block_yet(self):
+        path = self.write_mcp_json({"mcpServers": {"pentest": {"command": "x"}}})
+        code, _, err = self.call_main(["scope", "set", "10.8.0.0/16"])
+        self.assertEqual(code, EXIT_OK)
+        self.assertEqual(err, "")
+        self.assertEqual(self.scope_in(path), "10.8.0.0/16")
+
+    def test_set_without_a_pentest_server_exits_one(self):
+        path = self.write_mcp_json({"mcpServers": {"mission": {"command": "x"}}})
+        before = path.read_bytes()
+        code, _, err = self.call_main(["scope", "set", "10.8.0.0/16"])
+        self.assertEqual(code, EXIT_ERROR)
+        self.assertIn("pentest", err)
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_edit_without_any_fixture_exits_one(self):
+        code, _, err = self.call_main(["scope", "add", "10.8.0.0/16"])
+        self.assertEqual(code, EXIT_ERROR)
+        self.assertIn("no .mcp.json", err)
+
+    def test_add_appends_without_dropping_what_was_recorded(self):
+        path = self.write_mcp_json(self.pentest_fixture("10.0.0.0/24"))
+        code, _, _ = self.call_main(["scope", "add", "192.168.1.0/24,app.lan"])
+        self.assertEqual(code, EXIT_OK)
+        self.assertEqual(self.scope_in(path), "10.0.0.0/24,192.168.1.0/24,app.lan")
+
+    def test_add_keeps_the_recorded_order_and_only_appends(self):
+        path = self.write_mcp_json(self.pentest_fixture("10.0.0.0/24,192.168.1.0/24"))
+        code, _, _ = self.call_main(["scope", "add", "10.0.0.0/24,172.16.0.0/16"])
+        self.assertEqual(code, EXIT_OK)
+        self.assertEqual(self.scope_in(path), "10.0.0.0/24,192.168.1.0/24,172.16.0.0/16")
+
+    def test_add_deduplicates_a_target_already_recorded(self):
+        path = self.write_mcp_json(self.pentest_fixture("10.0.0.0/24,192.168.1.0/24"))
+        before = path.read_bytes()
+        code, out, _ = self.call_main(["scope", "add", "10.0.0.0/24"])
+        self.assertEqual(code, EXIT_OK)
+        self.assertIn("already", out)
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(self.backups(), [])
+
+    def test_add_rejects_a_bad_target_and_writes_nothing(self):
+        path = self.write_mcp_json(self.pentest_fixture("10.0.0.0/24"))
+        before = path.read_bytes()
+        code, _, err = self.call_main(["scope", "add", "*.example.com"])
+        self.assertEqual(code, EXIT_USAGE)
+        self.assertIn("wildcard", err)
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_add_accepts_a_recorded_zero_scope(self):
+        path = self.write_mcp_json(self.pentest_fixture("0.0.0.0/0"))
+        code, _, err = self.call_main(["scope", "add", "10.8.0.0/16"])
+        self.assertEqual(code, EXIT_OK)
+        self.assertEqual(err, "")
+        self.assertEqual(self.scope_in(path), "0.0.0.0/0,10.8.0.0/16")
+
+    def test_remove_drops_one_target_and_keeps_the_rest(self):
+        path = self.write_mcp_json(self.pentest_fixture("10.0.0.0/24,192.168.1.0/24,app.lan"))
+        code, _, _ = self.call_main(["scope", "remove", "192.168.1.0/24"])
+        self.assertEqual(code, EXIT_OK)
+        self.assertEqual(self.scope_in(path), "10.0.0.0/24,app.lan")
+
+    def test_remove_matches_a_normalised_form(self):
+        path = self.write_mcp_json(self.pentest_fixture("10.0.0.5/32,10.0.0.0/24"))
+        code, _, _ = self.call_main(["scope", "remove", "10.0.0.5"])
+        self.assertEqual(code, EXIT_OK)
+        self.assertEqual(self.scope_in(path), "10.0.0.0/24")
+
+    def test_remove_of_an_absent_target_changes_nothing(self):
+        path = self.write_mcp_json(self.pentest_fixture("10.0.0.0/24"))
+        before = path.read_bytes()
+        code, out, _ = self.call_main(["scope", "remove", "192.168.1.0/24"])
+        self.assertEqual(code, EXIT_OK)
+        self.assertIn("already", out)
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(self.backups(), [])
+
+    def test_remove_refuses_to_leave_no_target_at_all(self):
+        path = self.write_mcp_json(self.pentest_fixture("10.0.0.0/24"))
+        before = path.read_bytes()
+        code, _, err = self.call_main(["scope", "remove", "10.0.0.0/24"])
+        self.assertEqual(code, EXIT_ERROR)
+        self.assertIn("scope clear", err)
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(self.backups(), [])
+
+    def test_remove_with_nothing_recorded_exits_one(self):
+        path = self.write_mcp_json({"mcpServers": {"pentest": {"command": "x"}}})
+        before = path.read_bytes()
+        code, _, err = self.call_main(["scope", "remove", "10.0.0.0/24"])
+        self.assertEqual(code, EXIT_ERROR)
+        self.assertIn("nothing to remove", err)
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_remove_refuses_a_recorded_scope_it_cannot_parse(self):
+        path = self.write_mcp_json(self.pentest_fixture("not a scope"))
+        before = path.read_bytes()
+        code, _, err = self.call_main(["scope", "remove", "10.0.0.0/24"])
+        self.assertEqual(code, EXIT_ERROR)
+        self.assertIn("scope set", err)
+        self.assertEqual(path.read_bytes(), before)
+
+
 class TestRunLaunches(CliTestCase):
     def test_scope_is_recorded_then_the_binary_runs(self):
         path = self.write_mcp_json(self.pentest_fixture("127.0.0.1/32"))

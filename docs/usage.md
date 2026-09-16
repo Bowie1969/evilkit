@@ -8,8 +8,9 @@ written, what each flag does in practice, and a set of worked sessions you can c
 - [Worked example: scripted and CI runs](#worked-example-scripted-and-ci-runs)
 - [Worked example: several projects on one machine](#worked-example-several-projects-on-one-machine)
 - [Worked example: deviating from a project's scope](#worked-example-deviating-from-a-projects-scope)
-- [Worked example: inspecting and resetting the recorded scope](#worked-example-inspecting-and-resetting-the-recorded-scope)
+- [Worked example: inspecting and changing the recorded scope](#worked-example-inspecting-and-changing-the-recorded-scope)
 - [Worked example: reading the launch log](#worked-example-reading-the-launch-log)
+- [Worked example: watching the scope during a session](#worked-example-watching-the-scope-during-a-session)
 - [Worked example: the theme and the doctor command](#worked-example-the-theme-and-the-doctor-command)
 - [Scope syntax reference](#scope-syntax-reference)
 - [What gets written to `.mcp.json`](#what-gets-written-to-mcpjson)
@@ -345,21 +346,46 @@ The same switch is available as a setting, for a project where you never want th
 write_mcp_json = false
 ```
 
-## Worked example: inspecting and resetting the recorded scope
+## Worked example: inspecting and changing the recorded scope
 
 ```console
 $ evilkit scope show
 10.20.30.0/24,10.20.40.0/24
 
-$ evilkit scope clear
-evilkit: /srv/engagements/acme/.mcp.json reset to 127.0.0.1/32
+$ evilkit scope add 10.20.50.0/24
+evilkit: scope 10.20.30.0/24,10.20.40.0/24,10.20.50.0/24 recorded in /srv/engagements/acme/.mcp.json
+
+$ evilkit scope remove 10.20.40.0/24
+evilkit: scope 10.20.30.0/24,10.20.50.0/24 recorded in /srv/engagements/acme/.mcp.json
+
+$ evilkit scope set 10.20.30.0/24,app.internal
+evilkit: scope 10.20.30.0/24,app.internal recorded in /srv/engagements/acme/.mcp.json
 ```
+
+`scope set` replaces the record; `add` and `remove` fold a target list into it. All three write
+through the same validated, atomic, backed-up path the launcher uses, and all three take `--dry-run`
+to report the change without writing it:
+
+```console
+$ evilkit scope set solo --dry-run
+evilkit: would record 127.0.0.1/32 in /srv/engagements/acme/.mcp.json
+```
+
+A scope changes mid-engagement — a host is added once the client confirms it, or dropped when it is
+decommissioned — and these are how you change it without also starting a session. `run` writes the
+scope it is about to enforce; these commands are for when you want the record changed and nothing
+launched.
+
+`remove` subtracts *entries*, not address space: removing `10.20.40.5/32` from a record that holds
+`10.20.40.0/24` leaves the `/24` in place, so that host is still authorised. Remove the wider entry,
+or `scope set` the exact list you mean. Removing the last remaining target is refused outright, so an
+empty scope is never written by accident — use `scope clear` when that is what you want.
 
 `scope clear` writes the loopback default; it does not delete the key or the file. It is the right
 last step before archiving an engagement directory, before sharing it, or before uninstalling
 evilkit.
 
-When there is nothing to read, both fail loudly rather than printing nothing:
+When there is nothing to read, each fails loudly rather than printing nothing:
 
 ```console
 $ evilkit scope show
@@ -438,6 +464,73 @@ evilkit: no launches recorded yet (/home/you/.local/state/evilkit/launches.jsonl
 $ echo $?
 0
 ```
+
+## Worked example: watching the scope during a session
+
+The launcher writes the scope and hands over. For the rest of that session the boundary lives in a
+file, and `evilkit watch` is what tells you if the file moves. Run it beside the session — a second
+terminal, a split pane, or another `tmux` window:
+
+```console
+$ evilkit watch
+evilkit watch                                                         15:03:59
+──────────────────────────────────────────────────────────────────────────────
+scope in force    10.20.30.0/24
+recorded in       /srv/engagements/acme/.mcp.json  (last changed 12m 41s ago)
+watching for      12m 44s
+──────────────────────────────────────────────────────────────────────────────
+ALERTS
+  nothing has changed since this pane started
+──────────────────────────────────────────────────────────────────────────────
+RECENT LAUNCHES
+  15:01:15  10.20.30.0/24  enforced
+──────────────────────────────────────────────────────────────────────────────
+Ctrl-C to stop. This pane only reports; it decides nothing.
+```
+
+Nothing here is privileged. In a second terminal, the same thing any process on the machine could
+do:
+
+```console
+$ evilkit scope set 10.0.0.0/8
+evilkit: scope 10.0.0.0/8 recorded in /srv/engagements/acme/.mcp.json
+```
+
+The pane notices on its next sample and says so in the terms that matter — the new scope authorises
+addresses the old one did not:
+
+```console
+ALERTS (1)
+  15:16:40  !!  the recorded scope changed under you: 10.20.30.0/24 ->
+                10.0.0.0/8 and it is wider than before
+```
+
+A narrowing is reported the same way, but as a note rather than an alarm, because nothing has been
+over-authorised:
+
+```console
+ALERTS (1)
+  15:18:02  --  the recorded scope changed under you: 10.0.0.0/8 -> 10.0.0.0/24
+```
+
+Three things raise an alarm: the scope value changing, the `pentest` server disappearing or losing
+its scope key, and the file being deleted or becoming unreadable. A rewrite that leaves the scope
+byte-identical is a note, so saving the file in an editor is not an incident.
+
+Exit is `0` when the scope held throughout and `1` when any alarm was raised, which is what makes
+this usable in a script as well as on screen:
+
+```console
+$ evilkit watch --once --no-color | grep -c "scope in force"
+1
+$ echo $?
+0
+```
+
+The pane reads the file; it does not police a running process. It cannot see which scope a tool
+server already loaded before the change, and it stops nothing — an alarm means a session started
+*from that moment* would be wider than the one you authorised, which is exactly the moment worth
+knowing about.
 
 ## Worked example: the theme and the doctor command
 

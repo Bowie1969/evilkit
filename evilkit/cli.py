@@ -15,6 +15,7 @@ from . import (
     mcpscope,
     scope as scope_mod,
     theme as theme_mod,
+    watch as watch_mod,
 )
 
 __all__ = ["main", "build_parser"]
@@ -26,7 +27,7 @@ EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_USAGE = 2
 
-COMMANDS = ("run", "scope", "log", "doctor", "theme", "config", "version")
+COMMANDS = ("run", "scope", "log", "watch", "doctor", "theme", "config", "version")
 
 _EPILOG = """\
 examples:
@@ -36,7 +37,10 @@ examples:
   evilkit -s solo                    accept the locked-down default
   evilkit --no-write -- -c           leave .mcp.json alone, resume a session
   evilkit scope show                 print the scope recorded in .mcp.json
+  evilkit scope add 10.0.0.0/24      widen the record by one network
+  evilkit scope remove 10.0.0.0/24   drop one network from the record
   evilkit log                        list the launches recorded locally
+  evilkit watch                      watch the scope and alarm if it changes
   evilkit doctor                     check that everything is wired up
 
 Every argument after `--` is passed straight through to the Kimi Code CLI.
@@ -119,13 +123,36 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="do not append this launch to the local log",
     )
-    scope_cmd = sub.add_parser("scope", help="inspect or reset the recorded scope")
+    scope_cmd = sub.add_parser("scope", help="inspect or change the recorded scope")
     scope_sub = scope_cmd.add_subparsers(dest="scope_command", metavar="ACTION")
-    scope_cmd.set_defaults(scope_command=None, mcp_json=None)
+    scope_cmd.set_defaults(
+        scope_command=None, mcp_json=None, targets=None, allow_any=False, dry_run=False
+    )
     scope_show = scope_sub.add_parser("show", help="print the scope recorded in .mcp.json")
     scope_show.add_argument("--mcp-json", metavar="PATH", type=Path)
     scope_clear = scope_sub.add_parser("clear", help="reset the scope to the locked-down default")
     scope_clear.add_argument("--mcp-json", metavar="PATH", type=Path)
+
+    for action, blurb in (
+        ("set", "replace the recorded scope"),
+        ("add", "widen the recorded scope by the targets given"),
+        ("remove", "narrow the recorded scope by the targets given"),
+    ):
+        editor = scope_sub.add_parser(action, help=blurb)
+        editor.add_argument(
+            "targets",
+            metavar="TARGETS",
+            help="comma-separated hosts, IPs or CIDRs; 'solo' for the locked-down default",
+        )
+        editor.add_argument("--mcp-json", metavar="PATH", type=Path)
+        editor.add_argument(
+            "--allow-any",
+            action="store_true",
+            help="permit a /0 scope, which authorises every address",
+        )
+        editor.add_argument(
+            "--dry-run", action="store_true", help="report the change without writing it"
+        )
 
     log_cmd = sub.add_parser("log", help="list the launches recorded locally")
     log_cmd.add_argument(
@@ -138,6 +165,39 @@ def build_parser() -> argparse.ArgumentParser:
     )
     log_cmd.add_argument("--path", metavar="PATH", type=Path, help="read a different log file")
     log_cmd.add_argument("--json", action="store_true", help="print the raw log lines")
+
+    watch_cmd = sub.add_parser(
+        "watch", help="watch the recorded scope and alarm if it changes"
+    )
+    watch_cmd.add_argument(
+        "--mcp-json",
+        metavar="PATH",
+        type=Path,
+        help="path to .mcp.json (default: nearest one at or above the working directory)",
+    )
+    watch_cmd.add_argument(
+        "--interval",
+        metavar="SECONDS",
+        type=float,
+        default=1.0,
+        help="how often to sample the recorded scope (default: 1.0)",
+    )
+    watch_cmd.add_argument(
+        "--once",
+        action="store_true",
+        help="print a single frame and exit, for scripts and pipes",
+    )
+    watch_cmd.add_argument(
+        "--no-color", action="store_true", help="never use ANSI colour, even on a terminal"
+    )
+    watch_cmd.add_argument(
+        "-n",
+        "--limit",
+        metavar="N",
+        type=int,
+        default=5,
+        help="how many recent launches to show; 0 shows none (default: 5)",
+    )
 
     sub.add_parser("doctor", help="check the local installation")
 
@@ -415,6 +475,10 @@ def _cmd_run(args, config: config_mod.Config, problems: list[str]) -> int:
     return EXIT_OK
 
 
+#: Scope actions that change the record without launching anything.
+_SCOPE_EDITORS = frozenset({"set", "add", "remove"})
+
+
 def _cmd_scope(args, config: config_mod.Config) -> int:
     action = args.scope_command or "show"
     try:
@@ -426,6 +490,9 @@ def _cmd_scope(args, config: config_mod.Config) -> int:
     if mcp_path is None:
         _warn("no .mcp.json found")
         return EXIT_ERROR
+
+    if action in _SCOPE_EDITORS:
+        return _edit_scope(action, args, config, mcp_path)
 
     if action == "clear":
         target = scope_mod.SOLO_SCOPE
@@ -447,6 +514,86 @@ def _cmd_scope(args, config: config_mod.Config) -> int:
         _warn(f"{mcp_path} declares no pentest server")
         return EXIT_ERROR
     _out(current)
+    return EXIT_OK
+
+
+def _merge_scope(action: str, recorded: list[str], requested: list[str]) -> list[str]:
+    """Fold ``requested`` into ``recorded`` for an add or a remove.
+
+    The recorded order is kept, so a scope reads as the history of how it grew,
+    and a target already recorded is not repeated.
+    """
+    if action == "add":
+        known = set(recorded)
+        return [*recorded, *(token for token in requested if token not in known)]
+    dropped = set(requested)
+    return [token for token in recorded if token not in dropped]
+
+
+def _edit_scope(action: str, args, config: config_mod.Config, mcp_path: Path) -> int:
+    """Change the recorded scope in place, without launching the CLI.
+
+    A scope is meant to change mid-engagement — a host is added once the client
+    confirms it, or dropped when it is decommissioned — and re-running just to
+    repoint the file would also start a session. This edits the record alone,
+    through the same validated, atomic, backed-up write the launcher uses.
+    """
+    try:
+        requested = scope_mod.parse_scope(args.targets, allow_any=args.allow_any)
+    except scope_mod.ScopeError as exc:
+        _warn(f"{exc}")
+        _warn("expected a comma-separated list of hosts, IPs or CIDRs, or 'solo'")
+        return EXIT_USAGE
+
+    if action == "set":
+        # Deliberately no read: replacing a record needs nothing from it, and a
+        # file whose scope is already unreadable should still be fixable.
+        merged = list(requested)
+    else:
+        try:
+            current = mcpscope.read_scope(mcp_path)
+        except mcpscope.McpError as exc:
+            _warn(str(exc))
+            return EXIT_ERROR
+        if current is None:
+            if action == "remove":
+                _warn(f"nothing to remove: no scope is recorded in {mcp_path}")
+                return EXIT_ERROR
+            recorded: list[str] = []
+        else:
+            try:
+                # A /0 can only have been written deliberately, with --allow-any,
+                # so it must not disqualify the record from being merged.
+                recorded = scope_mod.parse_scope(current, allow_any=True)
+            except scope_mod.ScopeError as exc:
+                _warn(f"the scope recorded in {mcp_path} cannot be merged: {exc}")
+                _warn("use 'evilkit scope set' to replace it")
+                return EXIT_ERROR
+        merged = _merge_scope(action, recorded, requested)
+
+    if not merged:
+        _warn("that would leave no target at all; the record was left alone")
+        _warn("use 'evilkit scope clear' to reset to the locked-down default")
+        return EXIT_ERROR
+
+    target = ",".join(merged)
+    try:
+        changed = mcpscope.write_scope(
+            mcp_path, target, keep_backups=config.backup_keep, dry_run=args.dry_run
+        )
+    except mcpscope.McpError as exc:
+        _warn(str(exc))
+        return EXIT_ERROR
+
+    if args.dry_run:
+        if changed:
+            _out(f"{PROG}: would record {target} in {mcp_path}")
+        else:
+            _out(f"{PROG}: would leave {mcp_path} at {target}")
+    elif changed:
+        _out(f"{PROG}: scope {target} recorded in {mcp_path}")
+    else:
+        _out(f"{PROG}: scope already {target} in {mcp_path}")
     return EXIT_OK
 
 
@@ -478,6 +625,87 @@ def _cmd_log(args, config: config_mod.Config) -> int:
     if skipped:
         _warn(f"{skipped} unreadable line(s) in {path} were skipped")
     return EXIT_OK
+
+
+def _read_launches(path: Path, limit: int) -> tuple[list[dict], str]:
+    """The newest ``limit`` entries, and a note when the log cannot be read."""
+    if limit <= 0:
+        return [], ""
+    try:
+        entries, skipped = audit_mod.read(path, limit)
+    except audit_mod.LogError as exc:
+        return [], f"log unreadable ({exc})"
+    return entries, (f"{skipped} unreadable line(s) skipped" if skipped else "")
+
+
+def _cmd_watch(args, config: config_mod.Config) -> int:
+    """Follow the recorded scope for as long as the operator leaves the pane open.
+
+    Nothing here decides a scope or writes a file. The value is that the pane is
+    present at the moment the record changes — the moment a session quietly stops
+    being the one that was authorised. Exit is ``1`` if any alarm was raised, so
+    the same command works as a check in a script.
+    """
+    import time
+
+    try:
+        mcp_path = _resolve_mcp_path(args.mcp_json)
+    except mcpscope.McpNotFound as exc:
+        _warn(str(exc))
+        return EXIT_ERROR
+    if mcp_path is None:
+        _warn("no .mcp.json found; there is no recorded scope to watch")
+        return EXIT_ERROR
+
+    log_path = _audit_path(config)
+    interval = max(0.1, args.interval)
+    width = max(
+        60, min(shutil.get_terminal_size((watch_mod.DEFAULT_WIDTH, 24)).columns, 120)
+    )
+    interactive = sys.stdout.isatty()
+    color = not args.no_color and interactive and os.environ.get("NO_COLOR") is None
+
+    started = time.time()
+    state = watch_mod.snapshot(mcp_path)
+    alerts: list[watch_mod.Alert] = []
+
+    def frame() -> str:
+        launches, note = _read_launches(log_path, args.limit)
+        return watch_mod.render(
+            state,
+            launches,
+            alerts,
+            started=started,
+            now_ts=time.time(),
+            width=width,
+            color=color,
+            log_note=note,
+        )
+
+    if args.once:
+        # One plain frame and no cursor movement, so it can be piped or diffed.
+        _out(frame().rstrip("\n"))
+        return EXIT_OK
+
+    alarms = 0
+    try:
+        while True:
+            if interactive:
+                sys.stdout.write("\x1b[H\x1b[J")
+            sys.stdout.write(frame())
+            sys.stdout.flush()
+            time.sleep(interval)
+            sampled = watch_mod.snapshot(mcp_path)
+            change = watch_mod.compare(state, sampled)
+            if change is not None:
+                alerts.append(change)
+                if change.level == watch_mod.ALARM:
+                    alarms += 1
+            state = sampled
+    except KeyboardInterrupt:
+        _out()
+        _warn(f"watch stopped after {int(time.time() - started)}s with {alarms} alarm(s)")
+        return EXIT_ERROR if alarms else EXIT_OK
 
 
 def _cmd_doctor(config: config_mod.Config, problems: list[str]) -> int:
@@ -622,6 +850,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_scope(args, config)
     if args.command == "log":
         return _cmd_log(args, config)
+    if args.command == "watch":
+        return _cmd_watch(args, config)
     if args.command == "doctor":
         return _cmd_doctor(config, problems)
     if args.command == "theme":

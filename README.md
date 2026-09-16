@@ -190,8 +190,9 @@ Scope-gated launcher for the Kimi Code CLI.
 positional arguments:
   COMMAND
     run          set the scope and launch the Kimi Code CLI (default)
-    scope        inspect or reset the recorded scope
+    scope        inspect or change the recorded scope
     log          list the launches recorded locally
+    watch        watch the recorded scope and alarm if it changes
     doctor       check the local installation
     theme        manage the bundled colour theme
     config       show configuration
@@ -208,7 +209,10 @@ examples:
   evilkit -s solo                    accept the locked-down default
   evilkit --no-write -- -c           leave .mcp.json alone, resume a session
   evilkit scope show                 print the scope recorded in .mcp.json
+  evilkit scope add 10.0.0.0/24      widen the record by one network
+  evilkit scope remove 10.0.0.0/24   drop one network from the record
   evilkit log                        list the launches recorded locally
+  evilkit watch                      watch the scope and alarm if it changes
   evilkit doctor                     check that everything is wired up
 
 Every argument after `--` is passed straight through to the Kimi Code CLI.
@@ -220,7 +224,7 @@ Any first argument that is not one of the commands above is treated as an argume
 | Flag | Effect |
 |---|---|
 | `-h`, `--help` | Print help and exit `0`. |
-| `-V`, `--version` | Print `evilkit 1.0.0` and exit `0`. |
+| `-V`, `--version` | Print `evilkit 1.1.0` and exit `0`. |
 
 ### `evilkit run`
 
@@ -281,13 +285,21 @@ $ evilkit -- --model kimi-k2       # launches the CLI with --model kimi-k2
 | Command | Effect |
 |---|---|
 | `evilkit scope show` | Print the scope currently recorded in the `.mcp.json` evilkit finds. Exits `1` when no file or no `pentest` server is found. |
+| `evilkit scope set TARGETS` | Replace the recorded scope with `TARGETS`. |
+| `evilkit scope add TARGETS` | Add `TARGETS` to the recorded scope. A target already recorded is not repeated. |
+| `evilkit scope remove TARGETS` | Drop `TARGETS` from the recorded scope. Refused when it would leave no target at all. |
 | `evilkit scope clear` | Reset the recorded scope to `127.0.0.1/32`. |
 
-Both accept `--mcp-json PATH`. With no action, `evilkit scope` behaves as `scope show`.
+All of them accept `--mcp-json PATH`; `set`, `add` and `remove` also accept `--dry-run` and
+`--allow-any`. With no action, `evilkit scope` behaves as `scope show`. The four writing commands go
+through the same validated, atomic, backed-up path `run` uses, so a target list that does not parse
+changes nothing.
 
 ```console
 $ evilkit scope show
 10.20.30.0/24
+$ evilkit scope add 10.20.40.0/24
+evilkit: scope 10.20.30.0/24,10.20.40.0/24 recorded in /srv/engagements/acme/.mcp.json
 $ evilkit scope clear
 evilkit: /srv/engagements/acme/.mcp.json reset to 127.0.0.1/32
 ```
@@ -344,6 +356,64 @@ $ echo $?
 
 A line that cannot be parsed is skipped and counted on stderr, and the exit code is `1` only when
 the log cannot be read at all, or when it holds no readable line.
+
+### `evilkit watch`
+
+A live pane that watches the recorded scope and alarms when it changes. It launches nothing, writes
+nothing and decides nothing — it exists because `.mcp.json` *is* the boundary, and anything on the
+machine can edit it while a session is open.
+
+| Flag | Effect |
+|---|---|
+| `--mcp-json PATH` | Watch this file instead of the nearest one found from the working directory. |
+| `--interval SECONDS` | How often to sample. The default is `1.0`; the floor is `0.1`. |
+| `--once` | Print one frame and exit, for a status script or a pipe. |
+| `--no-color` | Never emit ANSI colour, even on a terminal. `NO_COLOR` is honoured too. |
+| `-n`, `--limit N` | How many recent launches to list. The default is `5`; `0` lists none. |
+
+```console
+$ evilkit watch
+evilkit watch                                                         15:03:59
+──────────────────────────────────────────────────────────────────────────────
+scope in force    10.20.30.0/24
+recorded in       /srv/engagements/acme/.mcp.json  (last changed 12m 41s ago)
+watching for      12m 44s
+──────────────────────────────────────────────────────────────────────────────
+ALERTS
+  nothing has changed since this pane started
+──────────────────────────────────────────────────────────────────────────────
+RECENT LAUNCHES
+  15:01:15  10.20.30.0/24  enforced
+──────────────────────────────────────────────────────────────────────────────
+Ctrl-C to stop. This pane only reports; it decides nothing.
+```
+
+Then something rewrites the scope — another launcher run, a script, an editor, the agent's own file
+tools — and the pane says so at once:
+
+```console
+ALERTS (1)
+  15:16:40  !!  the recorded scope changed under you: 10.20.30.0/24 ->
+                10.0.0.0/8 and it is wider than before
+```
+
+An alarm is raised when the scope changes, when the `pentest` server stops declaring one, and when
+the file is deleted or becomes unreadable. A rewrite that leaves the scope identical is a note, not
+an alarm, so an editor saving the file does not look like an incident.
+
+A change is called out as a *widening* only when that can be proved: every address the old scope
+authorised is still authorised, and the new scope authorises at least one address the old one did
+not. Hostnames, mixed IPv4/IPv6 lists and anything unparseable are reported as a plain change, never
+as a direction.
+
+Exit is `0` if the scope held for the whole run and `1` if any alarm was raised, so the same command
+works as a check in a script:
+
+```console
+$ evilkit watch --once --no-color > /dev/null
+$ echo $?
+0
+```
 
 ### `evilkit doctor`
 
@@ -412,7 +482,7 @@ options:
 
 ### `evilkit version`, `-V`, `--version`
 
-All three print `evilkit 1.0.0`.
+All three print `evilkit 1.1.0`.
 
 ### Exit codes
 
@@ -528,6 +598,10 @@ Scope is your call. evilkit never substitutes a wider target of its own, never g
 the only fallback it applies when it has nothing to go on is the loopback `127.0.0.1/32`. It will not
 quietly widen what you typed either: a network whose host bits are set is refused rather than
 rounded down.
+
+That is how `run` decides what to enforce. To change what is recorded *without* launching anything,
+use `evilkit scope set`, `add` or `remove`, which write through the same validated, atomic,
+backed-up path — see [`evilkit scope`](#evilkit-scope).
 
 Whatever the source, the value is normalised before it is written:
 
@@ -684,6 +758,14 @@ check, so it will write through a link where the subcommand refuses to. That cop
   the launcher uses `exec`.
 - **evilkit cannot undo a scope it recorded.** Uninstalling leaves `.mcp.json` exactly as your last
   run left it, including the recorded scope. Run `evilkit scope clear` first if that matters.
+- **`evilkit scope remove` subtracts entries, not address space.** Removing `10.20.40.5/32` from a
+  record that also holds `10.20.40.0/24` takes out only the host entry, so the `/24` still authorises
+  it. Overlapping entries are not collapsed either, and nothing checks whether one entry contains
+  another.
+- **`evilkit watch` watches the record, not the running session.** It samples `.mcp.json` and
+  reports what it finds; it cannot see which scope a tool server process has already loaded, and it
+  stops nothing. A widening it catches is a warning that a session started from that moment would be
+  wider than you authorised — not a claim about what an in-flight process is still doing.
 - **There is no verification of `.mcp.json` beyond JSON validity.** A file that is valid JSON but
   structurally wrong for your tool server is written as-is.
 - **evilkit does not vet the project you run it in.** It rewrites the `.mcp.json` it finds, and the
@@ -812,10 +894,10 @@ clean up, and the scope last written into `.mcp.json` stays there until you chan
 
 ## Status
 
-Version 1.0.0. The scope parser, the `.mcp.json` writer, the config, the theme installer, the launch
-log and `doctor` are the whole product: there is no plugin system and no Windows support. It fails
-closed by default, and the [Limitations](#limitations) above are the honest list of what it does not
-do.
+Version 1.1.0. The scope parser, the `.mcp.json` writer, the config, the theme installer, the launch
+log, `scope set/add/remove` and `watch` are the whole product: there is no plugin system and no
+Windows support. It fails closed by default, and the [Limitations](#limitations) above are the
+honest list of what it does not do.
 
 ## Disclaimer
 

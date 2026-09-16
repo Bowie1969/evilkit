@@ -5,12 +5,12 @@ A scope-gated launcher for the Kimi Code CLI.
 <!-- TODO(owner): replace with the live Gumroad product URL -->
 **[Buy evilkit](https://gumroad.com/l/REPLACE-ME)** — per-seat licence, includes updates.
 
-evilkit records one thing — the authorized target scope — in the right place, then hands over to
-the Kimi Code CLI. On each launch it collects a scope from `--scope`, an interactive prompt, or a
-configured default, validates and normalises it, writes it into the `PENTEST_ALLOWED_TARGETS` value
-of the `pentest` MCP server in the nearest `.mcp.json` (atomically, with a timestamped backup),
-exports it, and `exec`s the Kimi Code CLI with your arguments. It also ships a colour theme for the
-Kimi Code TUI and a `doctor` command.
+evilkit records two things — the authorized target scope, in the right place, and a line in a local
+launch log — then hands over to the Kimi Code CLI. On each launch it collects a scope from
+`--scope`, an interactive prompt, or a configured default, validates and normalises it, writes it
+into the `PENTEST_ALLOWED_TARGETS` value of the `pentest` MCP server in the nearest `.mcp.json`
+(atomically, with a timestamped backup), exports it, and `exec`s the Kimi Code CLI with your
+arguments. It also ships a colour theme for the Kimi Code TUI and a `doctor` command.
 
 The point is the thing you would otherwise forget or mistype: a pentest tool server takes its
 allowed targets from the `env` block of `.mcp.json`, and that block overrides whatever the parent
@@ -191,6 +191,7 @@ positional arguments:
   COMMAND
     run          set the scope and launch the Kimi Code CLI (default)
     scope        inspect or reset the recorded scope
+    log          list the launches recorded locally
     doctor       check the local installation
     theme        manage the bundled colour theme
     config       show configuration
@@ -207,6 +208,7 @@ examples:
   evilkit -s solo                    accept the locked-down default
   evilkit --no-write -- -c           leave .mcp.json alone, resume a session
   evilkit scope show                 print the scope recorded in .mcp.json
+  evilkit log                        list the launches recorded locally
   evilkit doctor                     check that everything is wired up
 
 Every argument after `--` is passed straight through to the Kimi Code CLI.
@@ -225,7 +227,7 @@ Any first argument that is not one of the commands above is treated as an argume
 ```console
 $ evilkit run --help
 usage: evilkit run [-h] [-s TARGETS] [--mcp-json PATH] [--no-write] [-y] [-n]
-                   [--allow-unscoped] [--allow-any] [--strict]
+                   [--allow-unscoped] [--allow-any] [--strict] [--no-audit]
 
 Set the authorized scope, then hand over to the Kimi Code CLI.
 
@@ -245,6 +247,7 @@ options:
   --allow-any           permit a /0 scope, which authorises every address
   --strict              deprecated; an unrecordable scope is already fatal
                         unless --allow-unscoped
+  --no-audit            do not append this launch to the local log
 ```
 
 The same `examples:` and `--` epilog that `evilkit --help` prints follows this output; it is omitted
@@ -260,6 +263,7 @@ here.
 | `--allow-unscoped` | Launch even when the requested scope could not be recorded. The run then enforces whatever scope the file already holds, which may be wider than the one requested; the banner says so. |
 | `--allow-any` | Permit a `/0` scope. Without it, `0.0.0.0/0` and `::/0` are refused. |
 | `--strict` | Deprecated and does nothing. Failing closed is the default, so an unrecordable scope is already fatal; the flag is still accepted so existing invocations keep working. |
+| `--no-audit` | Skip the launch log entry for this run. The launch itself is unchanged. |
 | `--` | Everything after it is passed through to the Kimi Code CLI untouched. |
 
 Options intended for the Kimi Code CLI must go after `--`. Any leading argument evilkit does not
@@ -288,10 +292,63 @@ $ evilkit scope clear
 evilkit: /srv/engagements/acme/.mcp.json reset to 127.0.0.1/32
 ```
 
+### `evilkit log`
+
+Prints the launch log: one line per launch, each naming the scope that launch was authorised for. It
+reads `$XDG_STATE_HOME/evilkit/launches.jsonl` — `~/.local/state/evilkit/launches.jsonl` by default,
+or `audit_path` if you set one — and never writes to it.
+
+| Flag | Effect |
+|---|---|
+| `-n`, `--limit N` | Show the newest `N` entries. The default is `20`; `0` shows every entry. |
+| `--path PATH` | Read this file instead of the configured log. |
+| `--json` | Print the stored lines exactly as they were written, one per line, oldest first, ready for `jq`. |
+
+The default output is newest-first, one entry per line:
+
+```text
+<timestamp>  <scope>  enforced|NOT enforced  <path to the .mcp.json, or - if none>
+```
+
+`enforced` means that scope was written into the `.mcp.json` named beside it, so it is the scope in
+force for the session. `NOT enforced` means it was not: `--no-write` left the file's existing `env`
+block in charge, and `--allow-unscoped` launched with nothing recorded. A `-` in the last column is
+an entry with no `.mcp.json` at all, which is what `--allow-unscoped` records when there was no file
+to write to. `--json` follows the file instead, oldest first.
+
+```console
+$ evilkit -s 10.20.30.0/24 -y
+evilkit: scope 10.20.30.0/24 recorded in /srv/engagements/acme/.mcp.json
+evilkit: authorized scope -> 10.20.30.0/24
+$ evilkit -s 10.20.30.9 -y --no-write
+evilkit: scope -> 10.20.30.9/32 (not written; --no-write)
+evilkit: scope -> 10.20.30.9/32 (NOT enforced; recorded scope is unchanged)
+$ evilkit log
+2026-09-16T04:24:34Z  10.20.30.9/32  NOT enforced  /srv/engagements/acme/.mcp.json
+2026-09-16T04:24:33Z  10.20.30.0/24  enforced  /srv/engagements/acme/.mcp.json
+$ evilkit log --json
+{"v": 1, "at": "2026-09-16T04:24:33Z", "event": "launch", "scope": "10.20.30.0/24", "enforced": true, "mcp_json": "/srv/engagements/acme/.mcp.json", "cwd": "/srv/engagements/acme", "kimi": "/home/you/.kimi-code/bin/kimi", "pid": 3892270}
+{"v": 1, "at": "2026-09-16T04:24:34Z", "event": "launch", "scope": "10.20.30.9/32", "enforced": false, "mcp_json": "/srv/engagements/acme/.mcp.json", "cwd": "/srv/engagements/acme", "kimi": "/home/you/.kimi-code/bin/kimi", "pid": 3892292}
+```
+
+Only a launch that happens is logged, so a dry run, a scope the parser rejected, and a run that
+could not find the Kimi Code CLI all record nothing. With no log file yet, the command says so and
+exits `0` — a fresh install with nothing recorded is a normal state, not an error:
+
+```console
+$ evilkit log
+evilkit: no launches recorded yet (/home/you/.local/state/evilkit/launches.jsonl)
+$ echo $?
+0
+```
+
+A line that cannot be parsed is skipped and counted on stderr, and the exit code is `1` only when
+the log cannot be read at all, or when it holds no readable line.
+
 ### `evilkit doctor`
 
 Reports the resolved Kimi Code binary, the config file in use, the `.mcp.json` it found, the scope
-recorded there, and whether the theme is installed.
+recorded there, whether the theme is installed, and the state of the launch log.
 
 ```console
 $ evilkit doctor
@@ -300,12 +357,16 @@ config file        : /home/you/.config/evilkit/config.toml absent (defaults)
 mcp.json           : /srv/engagements/acme/.mcp.json
 recorded scope     : 10.20.30.0/24
 theme installed    : yes (/home/you/.kimi-code/themes)
+audit log          : /home/you/.local/state/evilkit/launches.jsonl (last launch 2026-09-16T04:24:34Z)
 ```
 
 The `config file` line distinguishes three states: `ok` when the file was read, `absent (defaults)`
 when there is no file at all, and `unreadable (using defaults)` when a file exists but could not be
 parsed. Problems with individual keys are printed as `evilkit: ...` warnings above the report, and
 leave the line as `ok`, because the file itself parsed.
+
+The `audit log` line names the log file and its newest entry, or says `(nothing recorded yet)` or
+`disabled` when `audit = false`.
 
 ### `evilkit theme`
 
@@ -358,7 +419,7 @@ All three print `evilkit 1.0.0`.
 | Code | Meaning |
 |---|---|
 | `0` | Success. The CLI was launched, or the command did what was asked. |
-| `1` | Error: the requested scope could not be recorded (no `.mcp.json`, no `pentest` server, unreadable file, failed write), a missing Kimi Code binary, a `--mcp-json` path that does not exist, `config init` against an existing file, `theme install` against a modified theme file. A dry run exits `1` in the same situations. |
+| `1` | Error: the requested scope could not be recorded (no `.mcp.json`, no `pentest` server, unreadable file, failed write), a missing Kimi Code binary, a `--mcp-json` path that does not exist, `config init` against an existing file, `theme install` against a modified theme file, `evilkit log` against a log it cannot read or that holds no readable line. A dry run exits `1` in the same situations. |
 | `2` | Usage error: the scope was rejected by the parser, or an argument was not recognised. |
 
 ## Configuration
@@ -382,6 +443,12 @@ backup_keep = 5
 
 # Set false to launch without touching .mcp.json at all.
 write_mcp_json = true
+
+# Record every launch in a local append-only log.
+audit = true
+
+# Where that log lives (empty: $XDG_STATE_HOME/evilkit/launches.jsonl).
+audit_path = ""
 ```
 
 | Key | Default | Effect |
@@ -390,6 +457,8 @@ write_mcp_json = true
 | `default_scope` | `"127.0.0.1/32"` | The scope used when you accept the prompt without typing anything, when `-y` is given, or when stdin is not a TTY. Normalised on load; a value the scope parser rejects is ignored with a warning and the loopback default is used instead. |
 | `backup_keep` | `5` | How many timestamped `.mcp.json.*.bak` files to keep beside a project. A whole number: `true`, `1.9` and `"5"` are rejected with a warning and the default is used. `0` disables backups entirely; negative values are rejected too. |
 | `write_mcp_json` | `true` | Set `false` to launch without touching `.mcp.json` at all, as if `--no-write` had been passed. |
+| `audit` | `true` | Set `false` to launch without appending to the launch log, as if `--no-audit` had been passed on every run. |
+| `audit_path` | `""` | Where the launch log lives. Empty uses `$XDG_STATE_HOME/evilkit/launches.jsonl`, which is `~/.local/state/evilkit/launches.jsonl` by default; a leading `~` in a value you set is expanded. |
 | `[extra_env]` | empty | A table of string values merged into the environment handed to the Kimi Code CLI. It cannot set `PENTEST_ALLOWED_TARGETS`; that entry is dropped and reported. |
 
 A malformed file never stops a launch: every bad key falls back to its default and the run
@@ -407,6 +476,8 @@ kimi_bin        = kimi
 default_scope   = 127.0.0.1/32
 backup_keep     = 5
 write_mcp_json  = true
+audit           = true
+audit_path      = /home/you/.local/state/evilkit/launches.jsonl (default)
 config file     = /tmp/bad.toml
 ```
 
@@ -437,6 +508,7 @@ evilkit: extra_env cannot set PENTEST_ALLOWED_TARGETS; the authorised scope is t
 | `EVILKIT_KIMI_BIN` | Absolute path or command for the Kimi Code CLI. Overrides `kimi_bin` in the config. |
 | `EVILKIT_CONFIG` | Use this file as the config file instead of the default location. |
 | `EVILKIT_KIMI_HOME` | Kimi Code home directory used to locate `themes/`. Defaults to `~/.kimi-code`. |
+| `XDG_STATE_HOME` | Directory the default launch log lives under: the log is `<XDG_STATE_HOME>/evilkit/launches.jsonl`. Defaults to `~/.local/state`. A configured `audit_path` takes precedence. |
 | `PENTEST_ALLOWED_TARGETS` | Read as the scope when `--scope` is absent and the value is non-empty. |
 
 evilkit also sets `KIMI_CODE_IDENTITY_NAME` and `KIMI_CODE_IDENTITY_SLUG` to `evilkit` in the
@@ -616,18 +688,34 @@ check, so it will write through a link where the subcommand refuses to. That cop
   structurally wrong for your tool server is written as-is.
 - **evilkit does not vet the project you run it in.** It rewrites the `.mcp.json` it finds, and the
   Kimi Code CLI executes that file's `command`. See the warning below.
+- **The launch log is a local file that belongs to you, and it is not tamper-proof.** It is appended
+  to `$XDG_STATE_HOME/evilkit/launches.jsonl` (`~/.local/state/evilkit/launches.jsonl` by default)
+  with mode `0600` in a `0700` directory, and whoever ran the launcher can edit or delete it. Treat
+  it as a personal record, not as evidence about a third party.
+- **The log records what was asked for, not what was permitted.** `enforced` says only that evilkit
+  wrote that value into the `.mcp.json` named on the same line. It does not prove the tool server
+  honoured the scope, and nothing in the file shows what the session then did. Nothing reads the log
+  to make a decision.
+- **A launch is not always logged.** A log that cannot be written never stops a launch: evilkit
+  prints `evilkit: could not record this launch: ...` on stderr and carries on, so an unlogged launch
+  is possible and that warning is the only signal.
+- **The log is a record of launches, not of intent.** A dry run, a scope the parser rejected, and a
+  run that could not find the Kimi Code CLI all log nothing — the last of those after the scope has
+  already been written into `.mcp.json`.
+- **The log is never rotated.** Nothing prunes it and there is no size cap, so it grows by one line
+  per launch until you shorten or delete it yourself.
 
 ## Tests
 
-`python3 -m unittest discover -s tests -t .` from the project root runs the suite: 189 tests,
-covering the scope parser, the `.mcp.json` writer, the config loader, the theme installer and the
-CLI. It passes. Run it before trusting a scripted pipeline to a change:
+`python3 -m unittest discover -s tests -t .` from the project root runs the suite: 233 tests,
+covering the scope parser, the `.mcp.json` writer, the config loader, the theme installer, the
+launch log and the CLI. It passes. Run it before trusting a scripted pipeline to a change:
 
 ```console
 $ python3 -m unittest discover -s tests -t .
-.............................................................................................................................................................................................
+.........................................................................................................................................................................................................................................
 ----------------------------------------------------------------------
-Ran 189 tests in 1.293s
+Ran 233 tests in 2.123s
 
 OK
 ```
@@ -724,9 +812,10 @@ clean up, and the scope last written into `.mcp.json` stays there until you chan
 
 ## Status
 
-Version 1.0.0. The scope parser, the `.mcp.json` writer, the config, the theme installer and
-`doctor` are the whole product: there is no plugin system and no Windows support. It fails closed by
-default, and the [Limitations](#limitations) above are the honest list of what it does not do.
+Version 1.0.0. The scope parser, the `.mcp.json` writer, the config, the theme installer, the launch
+log and `doctor` are the whole product: there is no plugin system and no Windows support. It fails
+closed by default, and the [Limitations](#limitations) above are the honest list of what it does not
+do.
 
 ## Disclaimer
 

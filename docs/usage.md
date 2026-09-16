@@ -9,6 +9,7 @@ written, what each flag does in practice, and a set of worked sessions you can c
 - [Worked example: several projects on one machine](#worked-example-several-projects-on-one-machine)
 - [Worked example: deviating from a project's scope](#worked-example-deviating-from-a-projects-scope)
 - [Worked example: inspecting and resetting the recorded scope](#worked-example-inspecting-and-resetting-the-recorded-scope)
+- [Worked example: reading the launch log](#worked-example-reading-the-launch-log)
 - [Worked example: the theme and the doctor command](#worked-example-the-theme-and-the-doctor-command)
 - [Scope syntax reference](#scope-syntax-reference)
 - [What gets written to `.mcp.json`](#what-gets-written-to-mcpjson)
@@ -34,24 +35,27 @@ binary stops it.
    no file, no `pentest` server in it, or the write itself fails, the run stops with `exit 1` and the
    CLI is never started.
 6. Resolve the Kimi Code CLI binary. If it is not found, exit `1`.
-7. Print `evilkit: authorized scope -> <scope>`, flush stdout and stderr, and `exec` the CLI,
+7. Unless `--no-audit` was passed or `audit` is `false`, append one entry to the local launch log,
+   naming the scope and whether it was enforced. A log that cannot be written is a warning on stderr
+   and nothing else; the launch carries on.
+8. Print `evilkit: authorized scope -> <scope>`, flush stdout and stderr, and `exec` the CLI,
    replacing the evilkit process. Its exit status becomes the session's exit status, and no evilkit
    code runs afterwards.
 
-Because step 7 is an `exec`, the Kimi Code CLI is the process you Ctrl-C out of. evilkit does not run
+Because step 8 is an `exec`, the Kimi Code CLI is the process you Ctrl-C out of. evilkit does not run
 alongside it, does not read its output, and does not clean up after it. The flush in that step is why
 the status lines survive when stdout is a pipe or a log file rather than a terminal.
 
-Step 7 prints `authorized scope -> <scope>` only when that scope is in force: recorded in the file, or
+Step 8 prints `authorized scope -> <scope>` only when that scope is in force: recorded in the file, or
 deliberately left unwritten because you asked for that with `--no-write` or
 `write_mcp_json = false`. When `--allow-unscoped` lets a run continue after a failed step 5, the line
 is different — `scope -> <scope> (NOT enforced; recorded scope is unchanged)` — and the session runs
 under whatever scope the file already held.
 
 With `--dry-run`, steps 4 and 5 run against the same target and report the same failures and the same
-exit codes, and the write is replaced by a description of what it would have done. Adding
-`--no-write` as well takes a shortcut instead: the run stops after step 3, checks no target, and
-launches nothing.
+exit codes, and the write is replaced by a description of what it would have done. The run ends
+before step 7, so a dry run is never logged. Adding `--no-write` as well takes a shortcut instead:
+the run stops after step 3, checks no target, and launches nothing.
 
 The environment handed to the CLI is your environment, plus `PENTEST_ALLOWED_TARGETS` set to the
 normalised scope, plus `KIMI_CODE_IDENTITY_NAME` and `KIMI_CODE_IDENTITY_SLUG` set to `evilkit`
@@ -93,6 +97,7 @@ config file        : /home/you/.config/evilkit/config.toml absent (defaults)
 mcp.json           : /srv/engagements/acme/.mcp.json
 recorded scope     : 127.0.0.1/32
 theme installed    : yes (/home/you/.kimi-code/themes)
+audit log          : /home/you/.local/state/evilkit/launches.jsonl (nothing recorded yet)
 ```
 
 Now launch with the range you are authorised to test. `-n` first if you want to see the plan:
@@ -376,6 +381,64 @@ $ evilkit scope show --mcp-json /srv/engagements/globex/.mcp.json
 192.0.2.0/24
 ```
 
+## Worked example: reading the launch log
+
+Every launch that happens appends one line to the local log, and nothing else writes to it. Two
+launches, one of which recorded the scope and one of which deliberately did not:
+
+```console
+$ evilkit -s 10.20.30.0/24 -y
+evilkit: scope 10.20.30.0/24 recorded in /srv/engagements/acme/.mcp.json
+evilkit: authorized scope -> 10.20.30.0/24
+$ evilkit -s 10.20.30.9 -y --no-write
+evilkit: scope -> 10.20.30.9/32 (not written; --no-write)
+evilkit: scope -> 10.20.30.9/32 (NOT enforced; recorded scope is unchanged)
+```
+
+`evilkit log` prints them newest-first, and the two rows differ in the column that matters:
+
+```console
+$ evilkit log
+2026-09-16T04:24:34Z  10.20.30.9/32  NOT enforced  /srv/engagements/acme/.mcp.json
+2026-09-16T04:24:33Z  10.20.30.0/24  enforced  /srv/engagements/acme/.mcp.json
+```
+
+Both launches are in the log. The `--no-write` one is marked `NOT enforced` because that flag left
+the `.mcp.json` `env` block in charge, so that session ran under `10.20.30.0/24` while the command
+line asked for `10.20.30.9`. That is what the column is for: the requested scope is recorded either
+way, and the flag says whether it was the one actually written to the file. A `-` in the last column
+is an entry with no `.mcp.json` at all, which is what `--allow-unscoped` records when there is no
+file to write to.
+
+`--json` prints the stored lines themselves, oldest first, which is the form to pipe into `jq`:
+
+```console
+$ evilkit log --json
+{"v": 1, "at": "2026-09-16T04:24:33Z", "event": "launch", "scope": "10.20.30.0/24", "enforced": true, "mcp_json": "/srv/engagements/acme/.mcp.json", "cwd": "/srv/engagements/acme", "kimi": "/home/you/.kimi-code/bin/kimi", "pid": 3892270}
+{"v": 1, "at": "2026-09-16T04:24:34Z", "event": "launch", "scope": "10.20.30.9/32", "enforced": false, "mcp_json": "/srv/engagements/acme/.mcp.json", "cwd": "/srv/engagements/acme", "kimi": "/home/you/.kimi-code/bin/kimi", "pid": 3892292}
+```
+
+The file is `$XDG_STATE_HOME/evilkit/launches.jsonl`, or `~/.local/state/evilkit/launches.jsonl` by
+default, written `0600` inside a `0700` directory because it names client address ranges. `-n N`
+limits the output to the newest `N` entries and `0` means all of them, and `--path` reads a
+different file — a log you archived, for instance:
+
+```console
+$ evilkit log -n 1
+2026-09-16T04:24:34Z  10.20.30.9/32  NOT enforced  /srv/engagements/acme/.mcp.json
+```
+
+A launch that never happened is not in there. A dry run, a scope the parser rejected, and a run that
+could not find the Kimi Code CLI all log nothing, and with no log file yet the command is not an
+error:
+
+```console
+$ evilkit log
+evilkit: no launches recorded yet (/home/you/.local/state/evilkit/launches.jsonl)
+$ echo $?
+0
+```
+
 ## Worked example: the theme and the doctor command
 
 ```console
@@ -447,15 +510,17 @@ config file        : /home/you/.config/evilkit/config.toml absent (defaults)
 mcp.json           : /srv/engagements/acme/.mcp.json
 recorded scope     : 10.20.30.0/24
 theme installed    : yes (/home/you/.kimi-code/themes)
+audit log          : /home/you/.local/state/evilkit/launches.jsonl (last launch 2026-09-16T04:24:34Z)
 ```
 
 Read it as: the binary resolved, the state of the config file, the file evilkit would write, the
-scope currently recorded, and whether the theme file is present. The `config file` line reads
+scope currently recorded, whether the theme file is present, and where the launch log is and how
+recent its newest entry is (`disabled` when `audit = false`). The `config file` line reads
 `ok` when the file loaded, `absent (defaults)` when there is no file, and
 `unreadable (using defaults)` when a file is there but could not be parsed. A `MISSING` binary or an
-unreadable scope makes it exit `1`. Note that "no `.mcp.json` in this directory tree" does not make
-it exit `1`, so do not use `doctor` as a gate for that condition — use `evilkit scope show`, which
-does fail.
+unreadable scope makes it exit `1`, and the `audit log` line does not affect the exit code. Note that
+"no `.mcp.json` in this directory tree" does not make it exit `1`, so do not use `doctor` as a gate
+for that condition — use `evilkit scope show`, which does fail.
 
 ## Scope syntax reference
 
@@ -672,10 +737,11 @@ reading the file needs the file updated.
 into the tool server. It records one value; whether that value is what your server checks is outside
 what this launcher can verify.
 
-**A run in a script logged nothing** — check the exit code first: a run that never launched prints its
+**A run in a script printed nothing** — check the exit code first: a run that never launched prints its
 reason on stderr and exits `1` or `2`. When it does launch, the status lines are flushed before the
-CLI takes over, so they do reach a pipe or a log file. Read the recorded scope back with
-`evilkit scope show` if you want it on its own.
+CLI takes over, so they do reach a pipe or a log file. This is the run's own output on the terminal,
+not the launch log: read that back with `evilkit log`, and the scope recorded in `.mcp.json` with
+`evilkit scope show`.
 
 **A dry run was happy but the real run refused to write** — `--dry-run` takes no lock and creates no
 staging file, so it cannot tell you the directory is read-only. The real run reports the lock or

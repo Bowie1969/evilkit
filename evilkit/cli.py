@@ -8,7 +8,14 @@ import shutil
 import sys
 from pathlib import Path
 
-from . import __version__, config as config_mod, mcpscope, scope as scope_mod, theme as theme_mod
+from . import (
+    __version__,
+    audit as audit_mod,
+    config as config_mod,
+    mcpscope,
+    scope as scope_mod,
+    theme as theme_mod,
+)
 
 __all__ = ["main", "build_parser"]
 
@@ -19,7 +26,7 @@ EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_USAGE = 2
 
-COMMANDS = ("run", "scope", "doctor", "theme", "config", "version")
+COMMANDS = ("run", "scope", "log", "doctor", "theme", "config", "version")
 
 _EPILOG = """\
 examples:
@@ -29,6 +36,7 @@ examples:
   evilkit -s solo                    accept the locked-down default
   evilkit --no-write -- -c           leave .mcp.json alone, resume a session
   evilkit scope show                 print the scope recorded in .mcp.json
+  evilkit log                        list the launches recorded locally
   evilkit doctor                     check that everything is wired up
 
 Every argument after `--` is passed straight through to the Kimi Code CLI.
@@ -106,6 +114,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="deprecated; an unrecordable scope is already fatal unless --allow-unscoped",
     )
+    run.add_argument(
+        "--no-audit",
+        action="store_true",
+        help="do not append this launch to the local log",
+    )
     scope_cmd = sub.add_parser("scope", help="inspect or reset the recorded scope")
     scope_sub = scope_cmd.add_subparsers(dest="scope_command", metavar="ACTION")
     scope_cmd.set_defaults(scope_command=None, mcp_json=None)
@@ -113,6 +126,18 @@ def build_parser() -> argparse.ArgumentParser:
     scope_show.add_argument("--mcp-json", metavar="PATH", type=Path)
     scope_clear = scope_sub.add_parser("clear", help="reset the scope to the locked-down default")
     scope_clear.add_argument("--mcp-json", metavar="PATH", type=Path)
+
+    log_cmd = sub.add_parser("log", help="list the launches recorded locally")
+    log_cmd.add_argument(
+        "-n",
+        "--limit",
+        metavar="N",
+        type=int,
+        default=20,
+        help="show the newest N entries; 0 shows every entry (default: 20)",
+    )
+    log_cmd.add_argument("--path", metavar="PATH", type=Path, help="read a different log file")
+    log_cmd.add_argument("--json", action="store_true", help="print the raw log lines")
 
     sub.add_parser("doctor", help="check the local installation")
 
@@ -262,6 +287,50 @@ def _apply_scope(
     return normalised, EXIT_OK, True
 
 
+def _audit_path(config: config_mod.Config) -> Path:
+    """Where the launch log lives: the configured path, else the state default."""
+    if config.audit_path:
+        return Path(config.audit_path).expanduser()
+    return audit_mod.default_log_path()
+
+
+def _format_entry(entry: dict) -> str:
+    """Render one log entry as a single readable line."""
+    at = str(entry.get("at", "?"))
+    scope = str(entry.get("scope", "?"))
+    state = "enforced" if entry.get("enforced") else "NOT enforced"
+    target = entry.get("mcp_json") or "-"
+    return f"{at}  {scope}  {state}  {target}"
+
+
+def _record_launch(
+    config: config_mod.Config,
+    scope: str,
+    *,
+    enforced: bool,
+    mcp_path: Path | None,
+    kimi: str,
+    no_audit: bool,
+) -> None:
+    """Append this launch to the log, or say why it could not be written.
+
+    Never fatal. The log is a record *of* a launch, so refusing to launch
+    because the record could not be written would defeat the thing it records.
+    The warning goes to stderr, so a caller watching the exit code still sees a
+    successful launch.
+    """
+    if no_audit or not config.audit:
+        return
+
+    path = _audit_path(config)
+    entry = audit_mod.launch_entry(scope, enforced=enforced, mcp_json=mcp_path, kimi=kimi)
+    try:
+        audit_mod.record(path, entry)
+    except audit_mod.LogError as exc:
+        _warn(f"could not record this launch: {exc}")
+        _warn("the launch is continuing; set audit = false to silence this")
+
+
 def _launch_env(config: config_mod.Config, scope_value: str) -> dict[str, str]:
     env = dict(os.environ)
     env.setdefault("KIMI_CODE_IDENTITY_NAME", IDENTITY)
@@ -318,6 +387,15 @@ def _cmd_run(args, config: config_mod.Config, problems: list[str]) -> int:
         _warn("install it, or set kimi_bin in your config, or export EVILKIT_KIMI_BIN")
         return EXIT_ERROR
 
+    _record_launch(
+        config,
+        normalised,
+        enforced=enforced,
+        mcp_path=mcp_path,
+        kimi=kimi,
+        no_audit=args.no_audit,
+    )
+
     passthrough = list(args.passthrough or [])
     if passthrough and passthrough[0] == "--":
         passthrough = passthrough[1:]
@@ -372,6 +450,36 @@ def _cmd_scope(args, config: config_mod.Config) -> int:
     return EXIT_OK
 
 
+def _cmd_log(args, config: config_mod.Config) -> int:
+    path = args.path.expanduser() if args.path is not None else _audit_path(config)
+    limit = args.limit if args.limit and args.limit > 0 else None
+
+    try:
+        entries, skipped = audit_mod.read(path, limit)
+    except audit_mod.LogError as exc:
+        _warn(str(exc))
+        return EXIT_ERROR
+
+    if not entries:
+        if skipped:
+            _warn(f"{path} holds no readable entries; {skipped} line(s) were skipped")
+            return EXIT_ERROR
+        # A fresh install has no log yet. That is a normal state, not a failure.
+        _out(f"{PROG}: no launches recorded yet ({path})")
+        return EXIT_OK
+
+    if args.json:
+        for entry in entries:
+            _out(audit_mod.to_line(entry))
+    else:
+        for entry in reversed(entries):
+            _out(_format_entry(entry))
+
+    if skipped:
+        _warn(f"{skipped} unreadable line(s) in {path} were skipped")
+    return EXIT_OK
+
+
 def _cmd_doctor(config: config_mod.Config, problems: list[str]) -> int:
     ok = True
 
@@ -402,6 +510,21 @@ def _cmd_doctor(config: config_mod.Config, problems: list[str]) -> int:
 
     installed = theme_mod.is_installed()
     _out(f"theme installed    : {'yes' if installed else 'no'} ({theme_mod.kimi_themes_dir()})")
+
+    if not config.audit:
+        _out("audit log          : disabled")
+    else:
+        log_path = _audit_path(config)
+        try:
+            entries, skipped = audit_mod.read(log_path, limit=1)
+        except audit_mod.LogError as exc:
+            _out(f"audit log          : unreadable ({exc})")
+        else:
+            note = f"; {skipped} unreadable line(s) skipped" if skipped else ""
+            if not entries:
+                _out(f"audit log          : {log_path} (nothing recorded yet)")
+            else:
+                _out(f"audit log          : {log_path} (last launch {entries[-1].get('at', '?')}{note})")
 
     for problem in problems:
         _warn(problem)
@@ -455,6 +578,9 @@ def _cmd_config(args, config: config_mod.Config, problems: list[str]) -> int:
     _out(f"default_scope   = {config.default_scope}")
     _out(f"backup_keep     = {config.backup_keep}")
     _out(f"write_mcp_json  = {str(config.write_mcp_json).lower()}")
+    resolved_log = _audit_path(config)
+    _out(f"audit           = {str(config.audit).lower()}")
+    _out(f"audit_path      = {resolved_log}{'' if config.audit_path else ' (default)'}")
     _out(f"config file     = {config.source or config_mod.config_path()}")
     for problem in problems:
         _warn(problem)
@@ -494,6 +620,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_run(args, config, problems)
     if args.command == "scope":
         return _cmd_scope(args, config)
+    if args.command == "log":
+        return _cmd_log(args, config)
     if args.command == "doctor":
         return _cmd_doctor(config, problems)
     if args.command == "theme":

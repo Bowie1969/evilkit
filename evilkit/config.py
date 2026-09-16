@@ -67,6 +67,8 @@ class Config:
     default_scope: str = SOLO_SCOPE
     backup_keep: int = 5
     write_mcp_json: bool = True
+    audit: bool = True
+    audit_path: str = ""
     extra_env: dict[str, str] = field(default_factory=dict)
 
     #: Populated by :func:`load` so callers can report where settings came from.
@@ -96,6 +98,8 @@ def _coerce(raw: dict) -> tuple[dict, list[str]]:
         "default_scope",
         "backup_keep",
         "write_mcp_json",
+        "audit",
+        "audit_path",
         "extra_env",
     }
     values: dict = {}
@@ -131,6 +135,18 @@ def _coerce(raw: dict) -> tuple[dict, list[str]]:
             values["write_mcp_json"] = raw["write_mcp_json"]
         else:
             problems.append("write_mcp_json must be true or false")
+
+    if "audit" in raw:
+        if isinstance(raw["audit"], bool):
+            values["audit"] = raw["audit"]
+        else:
+            problems.append("audit must be true or false")
+
+    if "audit_path" in raw:
+        if isinstance(raw["audit_path"], str):
+            values["audit_path"] = raw["audit_path"].strip()
+        else:
+            problems.append("audit_path must be a string")
 
     if "extra_env" in raw:
         if isinstance(raw["extra_env"], dict) and all(
@@ -206,6 +222,12 @@ def dumps(config: Config) -> str:
         "",
         "# Set false to launch without touching .mcp.json at all.",
         f"write_mcp_json = {_format_value(config.write_mcp_json)}",
+        "",
+        "# Record every launch in a local append-only log.",
+        f"audit = {_format_value(config.audit)}",
+        "",
+        "# Where that log lives (empty: $XDG_STATE_HOME/evilkit/launches.jsonl).",
+        f"audit_path = {_format_value(config.audit_path)}",
     ]
     if config.extra_env:
         lines += ["", "[extra_env]"]

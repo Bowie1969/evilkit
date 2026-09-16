@@ -1,10 +1,11 @@
 """Shared hermetic harness for the evilkit test suite.
 
 Every test that touches disk runs inside its own ``tempfile.TemporaryDirectory``
-with ``HOME``, ``XDG_CONFIG_HOME``, ``EVILKIT_CONFIG``, ``EVILKIT_KIMI_HOME`` and
-``EVILKIT_KIMI_BIN`` all pointing into that directory, and with the process
-working directory set to it. Nothing can therefore read or write the developer's
-real ``~/.config``, ``~/.kimi-code``, or a real project ``.mcp.json``.
+with ``HOME``, ``XDG_CONFIG_HOME``, ``XDG_STATE_HOME``, ``EVILKIT_CONFIG``,
+``EVILKIT_KIMI_HOME`` and ``EVILKIT_KIMI_BIN`` all pointing into that directory,
+and with the process working directory set to it. Nothing can therefore read or
+write the developer's real ``~/.config``, ``~/.local/state``, ``~/.kimi-code``,
+or a real project ``.mcp.json``.
 
 Not collected by ``unittest discover`` (the file is not named ``test*``).
 """
@@ -65,6 +66,7 @@ class EvilkitTestCase(unittest.TestCase):
         env = {
             "HOME": str(self.home),
             "XDG_CONFIG_HOME": str(self.tmp / "xdg-config"),
+            "XDG_STATE_HOME": str(self.tmp / "xdg-state"),
             "EVILKIT_CONFIG": str(self.config_file),
             "EVILKIT_KIMI_HOME": str(self.kimi_home),
             "EVILKIT_KIMI_BIN": str(self.stub),

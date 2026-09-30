@@ -16,6 +16,7 @@ from evilkit.scope import (  # noqa: E402
     ScopeError,
     normalise_scope,
     parse_scope,
+    target_in_scope,
 )
 
 
@@ -122,7 +123,7 @@ class TestRejectedScopes(ScopeTestCase):
         "10.0.0.0/24 rm -rf /",
         "10.0.0.0/24,rm -rf /",
         "rm -rf /",
-        # wildcard scope tokens: the tool server cannot match them
+        # hostname wildcards: the tool server cannot match them
         "*",
         " * ",
         "**",
@@ -133,7 +134,11 @@ class TestRejectedScopes(ScopeTestCase):
         "*.example.com*",
         "*.*.example.com",
         "?",
-        "10.0.0.*",
+        # ambiguous or malformed range tokens
+        "192.168.1.*/25",
+        "10.*.0.*",
+        "10.0.0.1-10.0.0.50-10.0.0.60",
+        "10.0.0.50-10.0.0.1",
         # malformed networks
         "10.0.0.0/99",
         "10.0.0.0/-1",
@@ -236,7 +241,13 @@ class TestLegacyNumericAddresses(ScopeTestCase):
         self.assertEqual(normalise_scope("10.0.0.5"), "10.0.0.5/32")
 
 
-class TestWildcardsAreRejected(ScopeTestCase):
+class TestHostnameWildcardsAreRejected(ScopeTestCase):
+    """Hostname wildcards have no CIDR equivalent, so they stay refused.
+
+    IP wildcards are a different case -- they *are* exactly one CIDR, and are
+    expanded. See TestRangeExpansion.
+    """
+
     def test_a_wildcard_token_is_rejected(self):
         for raw in ("*.corp.example.com", "*.EXAMPLE.com.", "*.example.com"):
             with self.subTest(raw=raw):
@@ -251,10 +262,73 @@ class TestWildcardsAreRejected(ScopeTestCase):
         self.assertIn("tool server", message)
 
     def test_a_bare_star_is_still_rejected(self):
-        for raw in ("*", " * ", "**", "10.0.0.*", "example.*", "?"):
+        for raw in ("*", " * ", "**", "example.*", "?"):
             with self.subTest(raw=raw):
                 with self.assertRaises(ScopeError):
                     normalise_scope(raw)
+
+    def test_wildcards_that_are_not_a_trailing_run_are_rejected(self):
+        for raw in ("10.*.0.*", "10.0.*.5", "*.*.*.*", "256.1.1.*"):
+            with self.subTest(raw=raw):
+                with self.assertRaises(ScopeError):
+                    normalise_scope(raw)
+
+
+class TestRangeExpansion(ScopeTestCase):
+    """Range tokens expand to CIDR, and only to addresses that were written.
+
+    SHARED_TABLE is mirrored in the tool server's suite
+    (Cyber Operator/test_pentest_tools_server.py). The two implementations live
+    in separate packages, so the shared table is what stops them drifting apart.
+    """
+
+    SHARED_TABLE = [
+        ("192.168.1.*", "192.168.1.0/24"),
+        ("192.168.*.*", "192.168.0.0/16"),
+        ("10.0.0.0-10.0.0.255", "10.0.0.0/24"),
+        (
+            "192.168.1.10-50",
+            "192.168.1.10/31,192.168.1.12/30,192.168.1.16/28,"
+            "192.168.1.32/28,192.168.1.48/31,192.168.1.50/32",
+        ),
+    ]
+
+    def test_the_shared_table_expands_as_documented(self):
+        for raw, expected in self.SHARED_TABLE:
+            with self.subTest(raw=raw):
+                self.assertEqual(normalise_scope(raw), expected)
+
+    def test_expansion_does_not_widen_past_what_was_written(self):
+        self.assertEqual(normalise_scope("192.168.1.10-192.168.1.10"), "192.168.1.10/32")
+        self.assertNotIn("192.168.1.0/24", parse_scope("192.168.1.10-192.168.1.50"))
+        self.assertNotIn("192.168.0.0/16", parse_scope("192.168.1.*"))
+
+    def test_a_full_octet_range_collapses_to_one_network(self):
+        self.assertEqual(normalise_scope("192.168.1.0-192.168.1.255"), "192.168.1.0/24")
+
+    def test_a_range_entry_mixes_with_plain_entries(self):
+        self.assertEqual(
+            normalise_scope("192.168.1.*,10.0.0.5,app.lan"),
+            "192.168.1.0/24,10.0.0.5/32,app.lan",
+        )
+
+    def test_a_wildcard_with_a_prefix_is_refused_and_names_the_alternative(self):
+        with self.assertRaises(ScopeError) as ctx:
+            normalise_scope("192.168.1.*/25")
+        self.assertIn("192.168.1.0/25", str(ctx.exception))
+
+    def test_a_reversed_range_is_refused(self):
+        with self.assertRaises(ScopeError):
+            normalise_scope("10.0.0.50-10.0.0.1")
+
+    def test_a_dashed_hostname_is_untouched(self):
+        self.assertEqual(normalise_scope("my-host.example.com"), "my-host.example.com")
+        self.assertEqual(normalise_scope("host1.example.co.uk"), "host1.example.co.uk")
+
+    def test_a_malformed_range_is_refused_rather_than_read_as_a_hostname(self):
+        """Regression: this shape satisfied the hostname regex and was accepted."""
+        with self.assertRaises(ScopeError):
+            normalise_scope("10.0.0.1-10.0.0.50-10.0.0.60")
 
 
 class TestScopeTypos(ScopeTestCase):
@@ -272,6 +346,43 @@ class TestScopeTypos(ScopeTestCase):
             except ScopeError:
                 pass
         self.assertEqual(accepted, [], "these out-of-range targets must be rejected")
+
+
+class TestTargetInScope(ScopeTestCase):
+    def test_ip_target_inside_a_cidr_is_in_scope(self):
+        self.assertTrue(target_in_scope("10.0.0.5:443", "10.0.0.0/24"))
+
+    def test_ip_target_outside_every_cidr_is_not_in_scope(self):
+        self.assertFalse(target_in_scope("10.0.1.5:443", "10.0.0.0/24"))
+
+    def test_bare_ip_without_a_port_is_handled(self):
+        self.assertTrue(target_in_scope("10.0.0.5", "10.0.0.0/24"))
+
+    def test_hostname_target_matches_a_hostname_entry_exactly(self):
+        self.assertTrue(target_in_scope("host.example.com:8443", "host.example.com"))
+
+    def test_hostname_target_is_case_insensitive_and_ignores_trailing_dot(self):
+        self.assertTrue(target_in_scope("HOST.example.com.:80", "host.example.com"))
+
+    def test_hostname_target_is_not_covered_by_an_ip_network(self):
+        self.assertFalse(target_in_scope("host.example.com:80", "10.0.0.0/8"))
+
+    def test_ip_target_is_not_covered_by_a_hostname_entry(self):
+        self.assertFalse(target_in_scope("10.0.0.5:80", "example.com"))
+
+    def test_unparseable_scope_fails_closed(self):
+        self.assertFalse(target_in_scope("10.0.0.5:80", "not a scope!!"))
+
+
+class TestScopeEntryCap(ScopeTestCase):
+    def test_a_scope_with_too_many_entries_is_rejected(self):
+        many = ",".join(f"10.0.{i // 256}.{i % 256}" for i in range(300))
+        with self.assertRaises(ScopeError):
+            normalise_scope(many)
+
+    def test_a_scope_at_the_cap_is_accepted(self):
+        ok = ",".join(f"10.0.{i // 256}.{i % 256}" for i in range(256))
+        self.assertEqual(len(parse_scope(ok)), 256)
 
 
 if __name__ == "__main__":

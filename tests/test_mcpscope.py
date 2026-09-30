@@ -12,7 +12,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from _helpers import PROJECT_ROOT, EvilkitTestCase  # noqa: E402
+from _helpers import DENY_ENV_KEY, PROJECT_ROOT, EvilkitTestCase  # noqa: E402
 
 from evilkit import mcpscope  # noqa: E402
 
@@ -82,6 +82,139 @@ class TestReadScope(McpscopeTestCase):
     def test_exception_hierarchy(self):
         self.assertTrue(issubclass(mcpscope.McpNotFound, mcpscope.McpError))
         self.assertTrue(issubclass(mcpscope.NoPentestServer, mcpscope.McpError))
+
+
+class TestReadDeny(McpscopeTestCase):
+    def test_deny_env_key_name_is_the_documented_one(self):
+        self.assertEqual(mcpscope.DENY_ENV_KEY, "PENTEST_DENIED_TARGETS")
+
+    def test_returns_the_recorded_deny_list(self):
+        path = self.write_mcp_json(self.deny_fixture("10.0.0.0/24", deny="10.0.0.9/32"))
+        self.assertEqual(mcpscope.read_deny(path), "10.0.0.9/32")
+
+    def test_returns_none_when_no_deny_key_is_recorded(self):
+        path = self.write_mcp_json(self.pentest_fixture("10.0.0.0/24"))
+        self.assertIsNone(mcpscope.read_deny(path))
+
+    def test_an_empty_string_is_a_recorded_answer_not_a_missing_one(self):
+        path = self.write_mcp_json(self.deny_fixture("10.0.0.0/24", deny=""))
+        self.assertEqual(mcpscope.read_deny(path), "")
+
+    def test_returns_none_for_every_incomplete_fixture(self):
+        cases = {
+            "no mcpServers": {"other": 1},
+            "no pentest server": {"mcpServers": {"mission": {"command": "x"}}},
+            "no env block": {"mcpServers": {"pentest": {"command": "x"}}},
+            "env is not an object": {"mcpServers": {"pentest": {"env": []}}},
+            "deny is not a string": {
+                "mcpServers": {"pentest": {"env": {mcpscope.DENY_ENV_KEY: ["10.0.0.9"]}}}
+            },
+        }
+        for name, data in cases.items():
+            with self.subTest(case=name):
+                path = self.write_mcp_json(data, name=".mcp.json")
+                self.assertIsNone(mcpscope.read_deny(path))
+
+    def test_missing_file_raises(self):
+        with self.assertRaises(mcpscope.McpError):
+            mcpscope.read_deny(self.tmp / "absent.json")
+
+    def test_invalid_json_raises(self):
+        path = self.tmp / ".mcp.json"
+        path.write_text("{not json", encoding="utf-8")
+        with self.assertRaises(mcpscope.McpError):
+            mcpscope.read_deny(path)
+
+
+class TestWriteDeny(McpscopeTestCase):
+    """``PENTEST_DENIED_TARGETS`` is a second key, on the same terms."""
+
+    def env_in(self, path):
+        return json.loads(path.read_text(encoding="utf-8"))["mcpServers"]["pentest"]["env"]
+
+    def test_a_deny_list_is_written_beside_the_scope(self):
+        path = self.write_mcp_json(self.deny_fixture("127.0.0.1/32"))
+
+        self.assertTrue(
+            mcpscope.write_scope(path, "10.0.0.0/24", keep_backups=5, deny="10.0.0.9/32")
+        )
+
+        env = self.env_in(path)
+        self.assertEqual(env[mcpscope.SCOPE_ENV_KEY], "10.0.0.0/24")
+        self.assertEqual(env[mcpscope.DENY_ENV_KEY], "10.0.0.9/32")
+        self.assertEqual(env["OTHER_ENV"], "keep-me")
+        self.assertEqual(env["NUMERIC"], 7)
+        self.assertEqual(mcpscope.read_deny(path), "10.0.0.9/32")
+
+    def test_an_omitted_deny_is_left_untouched_when_the_scope_changes(self):
+        path = self.write_mcp_json(self.deny_fixture("127.0.0.1/32", deny="10.0.0.9/32"))
+
+        self.assertTrue(mcpscope.write_scope(path, "10.0.0.0/24"))
+
+        self.assertEqual(mcpscope.read_scope(path), "10.0.0.0/24")
+        self.assertEqual(mcpscope.read_deny(path), "10.0.0.9/32")
+
+    def test_an_omitted_deny_with_an_unchanged_scope_writes_nothing(self):
+        path = self.write_mcp_json(self.deny_fixture("10.0.0.0/24", deny="10.0.0.9/32"))
+        before = path.read_bytes()
+
+        self.assertFalse(mcpscope.write_scope(path, "10.0.0.0/24", keep_backups=5))
+
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(self.backups(), [])
+
+    def test_a_deny_only_change_is_written_and_backed_up(self):
+        path = self.write_mcp_json(self.deny_fixture("10.0.0.0/24", deny="10.0.0.9/32"))
+
+        self.assertTrue(
+            mcpscope.write_scope(path, "10.0.0.0/24", keep_backups=5, deny="10.0.0.10/32")
+        )
+
+        self.assertEqual(mcpscope.read_scope(path), "10.0.0.0/24")
+        self.assertEqual(mcpscope.read_deny(path), "10.0.0.10/32")
+        names = self.backups()
+        self.assertEqual(len(names), 1)
+        backup = json.loads((self.tmp / names[0]).read_text(encoding="utf-8"))
+        self.assertEqual(
+            backup["mcpServers"]["pentest"]["env"][mcpscope.DENY_ENV_KEY], "10.0.0.9/32"
+        )
+
+    def test_both_keys_matching_returns_false(self):
+        path = self.write_mcp_json(self.deny_fixture("10.0.0.0/24", deny="10.0.0.9/32"))
+        before = path.read_bytes()
+
+        self.assertFalse(
+            mcpscope.write_scope(path, "10.0.0.0/24", keep_backups=5, deny="10.0.0.9/32")
+        )
+
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(self.backups(), [])
+
+    def test_an_empty_deny_records_no_denied_targets(self):
+        path = self.write_mcp_json(self.deny_fixture("10.0.0.0/24", deny="10.0.0.9/32"))
+
+        self.assertTrue(mcpscope.write_scope(path, "10.0.0.0/24", deny=""))
+
+        self.assertEqual(mcpscope.read_deny(path), "")
+
+    def test_a_deny_only_change_in_a_dry_run_reports_a_change_and_writes_nothing(self):
+        path = self.write_mcp_json(self.deny_fixture("10.0.0.0/24", deny="10.0.0.9/32"))
+        before = path.read_bytes()
+
+        self.assertTrue(
+            mcpscope.write_scope(path, "10.0.0.0/24", dry_run=True, deny="10.0.0.10/32")
+        )
+
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(self.backups(), [])
+
+    def test_a_deny_list_can_be_added_to_a_file_that_has_none(self):
+        path = self.write_mcp_json(self.pentest_fixture("10.0.0.0/24"))
+
+        self.assertTrue(mcpscope.write_scope(path, "10.0.0.0/24", deny="10.0.0.9/32"))
+
+        self.assertEqual(mcpscope.read_deny(path), "10.0.0.9/32")
+        self.assertEqual(self.env_in(path)["OTHER_ENV"], "keep-me")
 
 
 class TestWriteScope(McpscopeTestCase):
@@ -445,6 +578,17 @@ class TestFind(McpscopeTestCase):
         deep.mkdir(parents=True)
         with self.assertRaises(mcpscope.McpNotFound):
             mcpscope.find(deep)
+
+
+class TestSymlinkRefusal(McpscopeTestCase):
+    def test_write_refuses_a_symlinked_target(self):
+        real = self.write_mcp_json(self.pentest_fixture("10.0.0.0/24"), name="real.json")
+        link = self.tmp / ".mcp.json"
+        link.symlink_to(real)
+        with self.assertRaises(mcpscope.McpError):
+            mcpscope.write_scope(link, "10.0.0.0/8")
+        # The link target keeps its original scope: nothing was written through it.
+        self.assertEqual(mcpscope.read_scope(real), "10.0.0.0/24")
 
 
 if __name__ == "__main__":

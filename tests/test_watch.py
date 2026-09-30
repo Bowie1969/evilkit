@@ -12,8 +12,10 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import threading
 import time
 import unittest
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -39,7 +41,14 @@ class WatchCase(EvilkitTestCase):
         return watch.snapshot(path)
 
     def spawn_watch(self, interval: str = "0.1"):
-        """Run the sampling loop as a real process, against the fixture dir."""
+        """Run the sampling loop as a real process, against the fixture dir.
+
+        A daemon thread drains the child's stdout as it is produced. Without it
+        the OS pipe buffer fills (the pane rewrites a full frame ~10x/second) and
+        the child blocks on write, freezing the very sampling loop the test is
+        trying to observe. The drained text is accumulated so ``wait_for`` and
+        ``stop`` can read what the pane has emitted so far.
+        """
         env = dict(os.environ)
         env["PYTHONPATH"] = os.pathsep.join(
             [str(PROJECT_ROOT), env.get("PYTHONPATH", "")]
@@ -52,18 +61,59 @@ class WatchCase(EvilkitTestCase):
             stderr=subprocess.PIPE,
             text=True,
         )
+        proc._evk_chunks = []  # type: ignore[attr-defined]
+        proc._evk_lock = threading.Lock()  # type: ignore[attr-defined]
+
+        def _drain() -> None:
+            for chunk in iter(lambda: proc.stdout.read(4096), ""):
+                with proc._evk_lock:  # type: ignore[attr-defined]
+                    proc._evk_chunks.append(chunk)  # type: ignore[attr-defined]
+
+        reader = threading.Thread(target=_drain, daemon=True)
+        reader.start()
+        proc._evk_reader = reader  # type: ignore[attr-defined]
         self.addCleanup(proc.kill)
         return proc
 
     @staticmethod
-    def stop(proc) -> str:
+    def _drained(proc) -> str:
+        with proc._evk_lock:  # type: ignore[attr-defined]
+            return "".join(proc._evk_chunks)  # type: ignore[attr-defined]
+
+    def wait_for(self, proc, needle: str, timeout: float = 10.0) -> str:
+        """Poll the drained output until ``needle`` appears or ``timeout`` elapses.
+
+        Replaces a fixed post-write sleep: the assertion no longer depends on a
+        sample landing inside an arbitrary window, so a loaded CPU only makes the
+        test slower, never flaky.
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            out = self._drained(proc)
+            if needle in out:
+                return out
+            time.sleep(0.02)
+        return self._drained(proc)
+
+    def settle(self, proc, seconds: float = 1.0) -> str:
+        """Let the loop run for a bounded spell (for asserting nothing appears)."""
+        time.sleep(seconds)
+        return self._drained(proc)
+
+    def stop(self, proc) -> str:
         try:
             proc.terminate()
-            out, _ = proc.communicate(timeout=15)
+            proc.wait(timeout=15)
         except subprocess.TimeoutExpired:  # pragma: no cover - defensive
             proc.kill()
-            out, _ = proc.communicate(timeout=15)
-        return out
+            proc.wait(timeout=15)
+        proc._evk_reader.join(timeout=5)  # type: ignore[attr-defined]
+        for stream in (proc.stdout, proc.stderr):
+            try:
+                stream.close()
+            except Exception:  # pragma: no cover - defensive
+                pass
+        return self._drained(proc)
 
 
 class TestWidened(unittest.TestCase):
@@ -275,9 +325,10 @@ class TestWatchCommand(WatchCase):
         path = self.write_mcp_json(self.pentest_fixture("10.0.0.0/24"))
         proc = self.spawn_watch()
         try:
-            time.sleep(0.6)
+            # Wait for the first frame so the change is made against a known sample.
+            self.wait_for(proc, "scope in force")
             self.write_mcp_json(self.pentest_fixture("10.0.0.0/8"), directory=path.parent)
-            time.sleep(0.8)
+            out = self.wait_for(proc, "the recorded scope changed under you")
         finally:
             out = self.stop(proc)
 
@@ -289,14 +340,36 @@ class TestWatchCommand(WatchCase):
         path = self.write_mcp_json(self.pentest_fixture("10.0.0.0/24"))
         proc = self.spawn_watch()
         try:
-            time.sleep(0.6)
+            self.wait_for(proc, "scope in force")
             self.write_mcp_json(self.pentest_fixture("10.0.0.0/24"), directory=path.parent)
-            time.sleep(0.8)
+            self.settle(proc)
         finally:
             out = self.stop(proc)
 
         self.assertNotIn("changed under you", out)
         self.assertNotIn("wider than before", out)
+
+
+class TestSanitisedRendering(unittest.TestCase):
+    """A scope string is attacker-influenced; escapes must not reach the pane."""
+
+    def _state(self, scope):
+        return watch.ScopeState(
+            path=Path("/tmp/.mcp.json"), scope=scope, digest="x", mtime=0.0
+        )
+
+    def test_escape_sequences_in_the_scope_are_neutralised(self):
+        evil = "10.0.0.0/24\x1b[2J\x1b[31m[ALERTS] verified"
+        frame = watch.render(
+            self._state(evil), [], [], started=0.0, now_ts=0.0, color=False
+        )
+        self.assertNotIn("\x1b", frame)
+        self.assertIn("�", frame)
+
+    def test_escape_sequences_in_a_launch_line_are_neutralised(self):
+        entry = {"at": "2026-01-01T00:00:00Z", "scope": "10.0.0.0/24\x1b[2J", "enforced": True}
+        line = watch.format_launch(entry)
+        self.assertNotIn("\x1b", line)
 
 
 if __name__ == "__main__":

@@ -16,7 +16,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from _helpers import SCOPE_ENV_KEY, EvilkitTestCase  # noqa: E402
+from _helpers import DENY_ENV_KEY, SCOPE_ENV_KEY, EvilkitTestCase  # noqa: E402
 
 from evilkit import __version__  # noqa: E402
 from evilkit.cli import EXIT_ERROR, EXIT_OK, EXIT_USAGE  # noqa: E402
@@ -26,6 +26,11 @@ class CliTestCase(EvilkitTestCase):
     def scope_in(self, path):
         return json.loads(path.read_text(encoding="utf-8"))["mcpServers"]["pentest"]["env"][
             SCOPE_ENV_KEY
+        ]
+
+    def deny_in(self, path):
+        return json.loads(path.read_text(encoding="utf-8"))["mcpServers"]["pentest"]["env"][
+            DENY_ENV_KEY
         ]
 
     def backups(self):
@@ -188,6 +193,19 @@ class TestScopeCommand(CliTestCase):
         code, _, err = self.call_main(["scope", "show"])
         self.assertEqual(code, EXIT_ERROR)
         self.assertIn("not valid JSON", err)
+
+    def test_show_reports_the_deny_list_when_one_is_recorded(self):
+        self.write_mcp_json(self.deny_fixture("10.0.0.0/24", deny="10.0.0.9/32"))
+        code, out, err = self.call_main(["scope", "show"])
+        self.assertEqual(code, EXIT_OK)
+        self.assertEqual(err, "")
+        self.assertEqual(out, "10.0.0.0/24\ndeny: 10.0.0.9/32\n")
+
+    def test_show_prints_the_scope_alone_when_the_deny_list_is_empty(self):
+        self.write_mcp_json(self.deny_fixture("10.0.0.0/24", deny=""))
+        code, out, _ = self.call_main(["scope", "show"])
+        self.assertEqual(code, EXIT_OK)
+        self.assertEqual(out, "10.0.0.0/24\n")
 
     def test_clear_resets_the_scope_to_the_locked_down_default(self):
         path = self.write_mcp_json(self.pentest_fixture("10.0.0.0/24"))
@@ -471,6 +489,18 @@ class TestRunLaunches(CliTestCase):
         self.assertEqual(code, EXIT_ERROR)
         self.assertIn("cannot find the Kimi Code CLI", err)
 
+    def test_a_missing_binary_leaves_the_recorded_scope_unchanged(self):
+        # The binary is checked before the scope is committed, so a launch that
+        # cannot start must not rewrite (and here widen) the recorded scope.
+        path = self.write_mcp_json(self.pentest_fixture("127.0.0.1/32"))
+        before = path.read_bytes()
+        with mock.patch.dict(os.environ, {"EVILKIT_KIMI_BIN": str(self.tmp / "env" / "absent")}):
+            code, _, err = self.call_main(["-s", "10.0.0.0/24", "-y"])
+        self.assertEqual(code, EXIT_ERROR)
+        self.assertIn("cannot find the Kimi Code CLI", err)
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(self.backups(), [])
+
     def test_strict_without_a_pentest_server_exits_one_and_writes_nothing(self):
         path = self.write_mcp_json({"mcpServers": {"mission": {"command": "x"}}})
         before = path.read_bytes()
@@ -604,6 +634,169 @@ class TestHostBitsOnTheCommandLine(CliTestCase):
         self.assertEqual(code, EXIT_USAGE)
         self.assertIn("did you mean 10.0.0.0/24?", err)
         self.assertEqual(path.read_bytes(), before)
+
+
+class TestDeny(CliTestCase):
+    """`run --deny` — refusing targets that are inside the allowed scope."""
+
+    def test_deny_is_written_alongside_the_scope(self):
+        path = self.write_mcp_json(self.pentest_fixture("127.0.0.1/32"))
+
+        proc = self.run_cli(["-s", "10.0.0.0/24", "--deny", "10.0.0.9", "-y"])
+
+        self.assertEqual(proc.returncode, EXIT_OK, proc.stderr)
+        self.assertEqual(self.scope_in(path), "10.0.0.0/24")
+        self.assertEqual(self.deny_in(path), "10.0.0.9/32")
+
+    def test_deny_expands_a_range_token(self):
+        path = self.write_mcp_json(self.pentest_fixture("127.0.0.1/32"))
+
+        proc = self.run_cli(["-s", "10.0.0.0/24", "--deny", "192.168.1.10-50", "-y"])
+
+        self.assertEqual(proc.returncode, EXIT_OK, proc.stderr)
+        self.assertEqual(
+            self.deny_in(path),
+            "192.168.1.10/31,192.168.1.12/30,192.168.1.16/28,"
+            "192.168.1.32/28,192.168.1.48/31,192.168.1.50/32",
+        )
+
+    def test_deny_is_normalised_like_an_allow_entry(self):
+        path = self.write_mcp_json(self.pentest_fixture("127.0.0.1/32"))
+
+        proc = self.run_cli(
+            ["-s", "10.0.0.0/24", "--deny", " APP.Example.COM. , 10.0.0.9 ", "-y"]
+        )
+
+        self.assertEqual(proc.returncode, EXIT_OK, proc.stderr)
+        self.assertEqual(self.deny_in(path), "app.example.com,10.0.0.9/32")
+
+    def test_an_omitted_deny_is_preserved(self):
+        path = self.write_mcp_json(self.deny_fixture("10.0.0.0/24", deny="10.0.0.9/32"))
+
+        proc = self.run_cli(["-s", "10.0.0.0/24", "-y"])
+
+        self.assertEqual(proc.returncode, EXIT_OK, proc.stderr)
+        self.assertEqual(self.deny_in(path), "10.0.0.9/32")
+        self.assertEqual(self.backups(), [])
+
+    def test_a_deny_only_change_writes_and_backs_up(self):
+        path = self.write_mcp_json(self.deny_fixture("10.0.0.0/24", deny="10.0.0.9/32"))
+        before = path.read_bytes()
+
+        proc = self.run_cli(["-s", "10.0.0.0/24", "--deny", "10.0.0.10/32", "-y"])
+
+        self.assertEqual(proc.returncode, EXIT_OK, proc.stderr)
+        self.assertNotEqual(path.read_bytes(), before)
+        self.assertEqual(self.deny_in(path), "10.0.0.10/32")
+        self.assertEqual(len(self.backups()), 1)
+
+    def test_the_same_deny_twice_is_a_no_op(self):
+        path = self.write_mcp_json(self.deny_fixture("10.0.0.0/24", deny="10.0.0.9/32"))
+        before = path.read_bytes()
+
+        proc = self.run_cli(["-s", "10.0.0.0/24", "--deny", "10.0.0.9/32", "-y"])
+
+        self.assertEqual(proc.returncode, EXIT_OK, proc.stderr)
+        self.assertIn("already", proc.stdout)
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(self.backups(), [])
+
+    def test_an_empty_deny_recorded_earlier_can_be_cleared(self):
+        path = self.write_mcp_json(self.deny_fixture("10.0.0.0/24", deny="10.0.0.9/32"))
+
+        proc = self.run_cli(["-s", "10.0.0.0/24", "--deny", "", "-y"])
+
+        self.assertEqual(proc.returncode, EXIT_OK, proc.stderr)
+        self.assertEqual(self.deny_in(path), "")
+
+    def test_an_empty_deny_never_denies_loopback(self):
+        """Regression: parse_scope("") answers with the solo sentinel.
+
+        An empty *allow* scope means "lock down to loopback". Routing an empty
+        deny list through the same reading would have denied the operator their
+        own loopback, which is not what "deny nothing" means.
+        """
+        for raw in ("", "   "):
+            with self.subTest(deny=raw):
+                path = self.write_mcp_json(self.pentest_fixture("10.0.0.0/24"))
+
+                proc = self.run_cli(["-s", "10.0.0.0/24", "--deny", raw, "-y"])
+
+                self.assertEqual(proc.returncode, EXIT_OK, proc.stderr)
+                self.assertEqual(self.deny_in(path), "")
+                self.assertNotEqual(self.deny_in(path), "127.0.0.1/32")
+
+    def test_an_invalid_deny_token_exits_two_and_writes_nothing(self):
+        path = self.write_mcp_json(self.pentest_fixture("10.0.0.0/24"))
+        before = path.read_bytes()
+
+        code, out, err = self.call_main(
+            ["-s", "127.0.0.1/32", "--deny", "10.0.0.0/24;rm -rf /", "-y"]
+        )
+
+        self.assertEqual(code, EXIT_USAGE)
+        self.assertEqual(out, "")
+        self.assertTrue(err)
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(self.backups(), [])
+
+    def test_an_invalid_deny_token_leaves_the_deny_list_alone(self):
+        path = self.write_mcp_json(self.deny_fixture("10.0.0.0/24", deny="10.0.0.9/32"))
+        before = path.read_bytes()
+
+        code, _, err = self.call_main(["-s", "10.0.0.0/24", "--deny", "*.example.com", "-y"])
+
+        self.assertEqual(code, EXIT_USAGE)
+        self.assertIn("wildcard", err)
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(self.backups(), [])
+
+    def test_a_deny_token_with_host_bits_is_rejected(self):
+        path = self.write_mcp_json(self.pentest_fixture("10.0.0.0/24"))
+        before = path.read_bytes()
+
+        code, _, err = self.call_main(["-s", "10.0.0.0/24", "--deny", "10.0.0.5/24", "-y"])
+
+        self.assertEqual(code, EXIT_USAGE)
+        self.assertIn("did you mean 10.0.0.0/24?", err)
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_a_dry_run_reports_the_deny_list_and_writes_nothing(self):
+        path = self.write_mcp_json(self.pentest_fixture("10.0.0.0/24"))
+        before = path.read_bytes()
+
+        code, out, _ = self.call_main(["-s", "10.0.0.0/24", "--deny", "10.0.0.9", "-y", "-n"])
+
+        self.assertEqual(code, EXIT_OK)
+        self.assertIn("[deny: 10.0.0.9/32]", out)
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(self.backups(), [])
+
+    def test_a_dry_run_of_the_same_deny_would_change_nothing(self):
+        self.write_mcp_json(self.deny_fixture("10.0.0.0/24", deny="10.0.0.9/32"))
+
+        code, out, _ = self.call_main(
+            ["-s", "10.0.0.0/24", "--deny", "10.0.0.9/32", "-y", "-n"]
+        )
+
+        self.assertEqual(code, EXIT_OK)
+        self.assertIn("would leave", out)
+        self.assertIn("[deny: 10.0.0.9/32]", out)
+
+    def test_a_deny_list_survives_scope_set(self):
+        path = self.write_mcp_json(self.deny_fixture("10.0.0.0/24", deny="10.0.0.9/32"))
+
+        code, _, err = self.call_main(["scope", "set", "10.8.0.0/16"])
+
+        self.assertEqual(code, EXIT_OK)
+        self.assertEqual(err, "")
+        self.assertEqual(self.scope_in(path), "10.8.0.0/16")
+        self.assertEqual(self.deny_in(path), "10.0.0.9/32")
+
+    def test_run_help_lists_the_deny_flag(self):
+        code, out, _ = self.call_main(["run", "--help"])
+        self.assertEqual(code, EXIT_OK)
+        self.assertIn("--deny", out)
 
 
 class TestExtraEnvCannotOverrideTheScope(CliTestCase):

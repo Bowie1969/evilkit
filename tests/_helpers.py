@@ -28,6 +28,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 SCOPE_ENV_KEY = "PENTEST_ALLOWED_TARGETS"
+DENY_ENV_KEY = "PENTEST_DENIED_TARGETS"
 
 #: Stand-in for the Kimi Code CLI. Prints its argv and the launch environment so
 #: a test can prove what actually reached the child process.
@@ -114,6 +115,12 @@ class EvilkitTestCase(unittest.TestCase):
             },
             "topLevel": {"nested": [1, 2, {"flag": True}], "unicode": "héllo"},
         }
+
+    def deny_fixture(self, scope: str = "10.0.0.0/24", deny: str = "") -> dict:
+        """A .mcp.json whose pentest env holds both the allow and the deny key."""
+        data = self.pentest_fixture(scope)
+        data["mcpServers"]["pentest"]["env"][DENY_ENV_KEY] = deny
+        return data
 
     # -- invocation helpers --------------------------------------------------
 

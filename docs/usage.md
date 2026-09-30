@@ -32,9 +32,10 @@ binary stops it.
 4. Resolve where the scope goes: the path from `--mcp-json`, or the nearest `.mcp.json` at or above
    the working directory.
 5. Unless `--no-write` was passed or `write_mcp_json` is `false`, record the scope in
-   `mcpServers.pentest.env.PENTEST_ALLOWED_TARGETS`. This is the step that fails closed: if there is
-   no file, no `pentest` server in it, or the write itself fails, the run stops with `exit 1` and the
-   CLI is never started.
+   `mcpServers.pentest.env.PENTEST_ALLOWED_TARGETS`, and the `--deny` list in
+   `mcpServers.pentest.env.PENTEST_DENIED_TARGETS` when that flag was given. This is the step that
+   fails closed: if there is no file, no `pentest` server in it, or the write itself fails, the run
+   stops with `exit 1` and the CLI is never started.
 6. Resolve the Kimi Code CLI binary. If it is not found, exit `1`.
 7. Unless `--no-audit` was passed or `audit` is `false`, append one entry to the local launch log,
    naming the scope and whether it was enforced. A log that cannot be written is a warning on stderr
@@ -61,7 +62,25 @@ the run stops after step 3, checks no target, and launches nothing.
 The environment handed to the CLI is your environment, plus `PENTEST_ALLOWED_TARGETS` set to the
 normalised scope, plus `KIMI_CODE_IDENTITY_NAME` and `KIMI_CODE_IDENTITY_SLUG` set to `evilkit`
 unless they were already set, plus everything in `[extra_env]` from your config. The scope is applied
-last, so no `[extra_env]` entry can override it.
+last, so no `[extra_env]` entry can override it. A deny list is not added to that environment: it is
+written to the file, which is the copy the tool server reads, and omitting `--deny` leaves it alone.
+
+`--deny` is the other half of the boundary. It records `PENTEST_DENIED_TARGETS` from the same
+comma-separated syntax `--scope` takes — ranges, hostnames and IPv6 included — and the tool server
+checks that list first, so a deny entry wins over an allow entry. It is how "all of `10.20.30.0/24`
+except `10.20.30.7`" is expressed:
+
+```console
+$ evilkit -s 10.20.30.0/24 --deny 10.20.30.7 -n
+evilkit: would record 10.20.30.0/24 in /srv/engagements/acme/.mcp.json [deny: 10.20.30.7/32]
+evilkit: would launch /home/you/.kimi-code/bin/kimi
+```
+
+Omitting `--deny` leaves the recorded deny list exactly as it was, so a bare re-scope never blanks
+one. An empty `--deny` records "deny nothing" — the empty value is not the `solo` loopback alias,
+because those aliases describe an *allow* scope, where "nothing" means "lock down to loopback".
+Both lists are validated before either is written, so a deny entry that does not parse leaves the
+file untouched and exits `2`.
 
 ## Worked example: preparing an engagement
 
@@ -261,7 +280,8 @@ evilkit: authorized scope -> 10.20.30.0/24
 
 The child process's own output follows, because from that point the CLI has inherited the same
 streams. If you want the scope as data rather than as log text, read it back with
-`evilkit scope show`, which prints the value from the file and nothing else.
+`evilkit scope show`, whose first line is the value from the file — a second `deny:` line follows
+only when a deny list is recorded.
 
 ## Worked example: several projects on one machine
 
@@ -383,7 +403,19 @@ empty scope is never written by accident — use `scope clear` when that is what
 
 `scope clear` writes the loopback default; it does not delete the key or the file. It is the right
 last step before archiving an engagement directory, before sharing it, or before uninstalling
-evilkit.
+evilkit. It leaves any deny list alone: `set`, `add`, `remove` and `clear` all rewrite the scope
+value only, and the deny list changes only when `evilkit run --deny` says so.
+
+`scope show` prints the deny list on a second line whenever one is recorded, so the two halves of the
+boundary are read back together:
+
+```console
+$ evilkit scope show
+10.20.30.0/24
+deny: 10.20.30.7/32
+```
+
+When no deny list is recorded, or the recorded one is empty, only the scope is printed.
 
 When there is nothing to read, each fails loudly rather than printing nothing:
 
@@ -661,6 +693,10 @@ evilkit: would record 10.0.0.5/32,solo in /srv/engagements/acme/.mcp.json
 evilkit: would launch /home/you/.kimi-code/bin/kimi
 ```
 
+The same syntax, limits and refusals apply to `--deny`, so a denied target is written in exactly the
+form the same token would take as a scope entry. The one difference is the empty value: as a scope it
+means the `solo` loopback default, and as a deny list it means "deny nothing".
+
 Rejections look like this and exit `2`:
 
 ```console
@@ -681,6 +717,17 @@ evilkit: '10.0.0.256' looks like an IP address but is not valid
 evilkit: expected a comma-separated list of hosts, IPs or CIDRs, or 'solo'
 ```
 
+```console
+$ evilkit -s 10.20.30.0/24 --deny '*.example.com' -n
+evilkit: '*.example.com' uses wildcard matching, which the tool server cannot enforce
+evilkit: expected a comma-separated list of hosts, IPs or CIDRs for the deny list
+$ echo $?
+2
+```
+
+The second line names the list that was rejected, so it is clear which of the two values was at
+fault. Nothing is written: both lists are validated before the file is touched.
+
 Mixing kinds in one scope is fine:
 
 ```console
@@ -699,8 +746,9 @@ evilkit: would launch /home/you/.kimi-code/bin/kimi
 
 ## What gets written to `.mcp.json`
 
-Strictly one value: `mcpServers.pentest.env.PENTEST_ALLOWED_TARGETS`. Everything else in the file is
-read, re-serialised and written back unchanged. Concretely:
+One value, plus the deny list when `--deny` asks for it:
+`mcpServers.pentest.env.PENTEST_ALLOWED_TARGETS`, and `mcpServers.pentest.env.PENTEST_DENIED_TARGETS`.
+Everything else in the file is read, re-serialised and written back unchanged. Concretely:
 
 - The file is found by walking up from the working directory, or taken from `--mcp-json`.
 - A file with no `mcpServers.pentest` entry is not modified, and the run stops with `exit 1` because
@@ -721,7 +769,9 @@ read, re-serialised and written back unchanged. Concretely:
 - Backups beyond `backup_keep` are deleted, oldest first, ordered by timestamp and then by that
   suffix, so the ones kept are genuinely the newest. `backup_keep = 0` skips both the backup and the
   pruning, so the swap is direct.
-- When the value already equals the scope, the file is not written and no backup is made.
+- When both values already equal what was asked for, the file is not written and no backup is made.
+  A deny list that changed on its own is not that case: it is written and backed up like any other
+  change.
 - Input that cannot be parsed is reported as a message rather than a traceback: invalid UTF-8, invalid
   JSON, and JSON nested too deeply all produce a clean error and the fail-closed exit.
 - The whole file is re-serialised with two-space indentation, so the first run after you hand-edit

@@ -52,6 +52,22 @@ DEFAULT_WIDTH = 78
 RULE_CHAR = "\u2500"
 
 
+def _safe(text: str) -> str:
+    """Strip control characters from text that came from the watched file.
+
+    The scope string is attacker-influenced: anything on the machine can write
+    ``.mcp.json``. Rendered verbatim, an embedded escape sequence (``\\x1b``)
+    could clear the pane or spoof an ``[ALERTS] scope verified`` line \u2014 turning
+    the one thing meant to catch a silent widening into its cover. Control
+    characters (C0, DEL and C1) are replaced with a visible placeholder so the
+    raw text is still shown but can no longer drive the terminal.
+    """
+    return "".join(
+        ch if ch == "\t" or (ch.isprintable() and not (0x80 <= ord(ch) <= 0x9F)) else "\ufffd"
+        for ch in text
+    )
+
+
 @dataclass(frozen=True)
 class ScopeState:
     """One sample of the recorded scope, and enough to tell it was resampled."""
@@ -203,7 +219,8 @@ def _duration(seconds: float) -> str:
 def format_launch(entry: dict) -> str:
     """One launch as a single pane line."""
     state = "enforced" if entry.get("enforced") else "NOT enforced"
-    return f"{_local_hms(entry.get('at', '?'))}  {entry.get('scope', '?')}  {state}"
+    scope = _safe(str(entry.get("scope", "?")))
+    return f"{_local_hms(entry.get('at', '?'))}  {scope}  {state}"
 
 
 def _title(left: str, right: str, width: int) -> str:
@@ -241,9 +258,9 @@ def render(
         rule,
     ]
 
-    scope_text = state.scope or "none recorded"
+    scope_text = _safe(state.scope) if state.scope else "none recorded"
     if state.error is not None and state.scope is None:
-        scope_text = f"unknown  ({state.error})"
+        scope_text = f"unknown  ({_safe(state.error)})"
     lines.append(f"{'scope in force':<18}{scope_text}")
 
     if state.mtime is None:
@@ -260,7 +277,7 @@ def render(
             marker = "!!" if alert.level == ALARM else "--"
             prefix = f"  {alert.at}  {marker}  "
             for index, chunk in enumerate(
-                textwrap.wrap(alert.text, max(24, width - len(prefix))) or [""]
+                textwrap.wrap(_safe(alert.text), max(24, width - len(prefix))) or [""]
             ):
                 lead = prefix if index == 0 else " " * len(prefix)
                 if alert.level == ALARM and color:

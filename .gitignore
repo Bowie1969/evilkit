@@ -40,6 +40,15 @@ id_ed25519
 id_ecdsa
 id_dsa
 
+# Mobile companion runtime data and build artifacts
+mobile/companion/__pycache__/
+mobile/companion/*.jsonl
+mobile/companion/data/
+mobile/ios/build/
+mobile/ios/DerivedData/
+mobile/ios/*.xcworkspace/xcuserdata/
+mobile/ios/*.xcodeproj/xcuserdata/
+
 # Editors and OS cruft
 .DS_Store
 .idea/

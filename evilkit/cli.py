@@ -10,6 +10,7 @@ from pathlib import Path
 
 from . import (
     __version__,
+    agent as agent_mod,
     audit as audit_mod,
     config as config_mod,
     mcpscope,
@@ -27,7 +28,7 @@ EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_USAGE = 2
 
-COMMANDS = ("run", "scope", "log", "watch", "doctor", "theme", "config", "version")
+COMMANDS = ("run", "scope", "log", "watch", "doctor", "theme", "config", "agent", "version")
 
 _EPILOG = """\
 examples:
@@ -77,6 +78,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--scope",
         metavar="TARGETS",
         help="comma-separated hosts, IPs or CIDRs; 'solo' for the locked-down default",
+    )
+    run.add_argument(
+        "--deny",
+        metavar="TARGETS",
+        help=(
+            "comma-separated targets to refuse even inside the scope; "
+            "an empty value denies nothing (omit it to leave the record alone)"
+        ),
     )
     run.add_argument(
         "--mcp-json",
@@ -213,6 +222,44 @@ def build_parser() -> argparse.ArgumentParser:
     config_sub.add_parser("show", help="print the effective configuration")
     config_sub.add_parser("init", help="write a commented default config file")
 
+    agent_cmd = sub.add_parser(
+        "agent",
+        help="run a versioned Kimi K3 augmentation config against a target",
+        description="Load a versioned agent config and run it through the Kimi Code CLI.",
+    )
+    agent_cmd.add_argument(
+        "--config",
+        metavar="PATH",
+        type=Path,
+        help="path to the agent config TOML file",
+    )
+    agent_cmd.add_argument(
+        "--target",
+        metavar="HOST:PORT",
+        help="authorized target for the agent to assess",
+    )
+    agent_cmd.add_argument(
+        "--interactive",
+        action="store_true",
+        help="after the first response, allow follow-up prompts",
+    )
+    agent_cmd.add_argument(
+        "--list",
+        action="store_true",
+        help="list built-in agent configs and exit",
+    )
+    agent_cmd.add_argument(
+        "--mcp-json",
+        metavar="PATH",
+        type=Path,
+        help="path to the .mcp.json whose recorded scope gates this run",
+    )
+    agent_cmd.add_argument(
+        "--no-audit",
+        action="store_true",
+        help="do not append this launch to the local log",
+    )
+
     sub.add_parser("version", help="print the version")
 
     return parser
@@ -282,6 +329,30 @@ def _not_recorded(
     return "", EXIT_ERROR, False
 
 
+def _normalise_deny(raw: str | None, *, allow_any: bool) -> str | None:
+    """Normalise a ``--deny`` value, or None when the flag was not given.
+
+    None is not the same as empty: it means "say nothing about the deny list",
+    which leaves whatever is recorded in place. An empty value is the explicit
+    "deny nothing" and is handled here rather than by ``parse_scope``, whose
+    empty-string answer is the solo loopback sentinel — an empty *allow* scope
+    means "lock down to loopback", but there is no equivalent reading for a deny
+    list, and inheriting that one would deny the operator's own loopback.
+    """
+    if raw is None:
+        return None
+    if not raw.strip():
+        return ""
+    return scope_mod.normalise_scope(raw, allow_any=allow_any)
+
+
+def _deny_note(deny: str | None) -> str:
+    """A suffix naming the deny list that goes with a reported scope, if any."""
+    if deny is None:
+        return ""
+    return f" [deny: {deny or 'none'}]"
+
+
 def _apply_scope(
     scope_text: str,
     mcp_path: Path | None,
@@ -291,6 +362,7 @@ def _apply_scope(
     allow_unscoped: bool,
     allow_any: bool,
     dry_run: bool = False,
+    deny_text: str | None = None,
 ) -> tuple[str, int, bool]:
     """Validate the scope and record it. Returns (scope, exit_code, enforced).
 
@@ -300,6 +372,10 @@ def _apply_scope(
     scope is genuinely in force, which means it was recorded in the file and
     nothing else. A scope that was deliberately not written cannot be enforced:
     the file still holds whatever it held before.
+
+    ``deny_text`` is the raw ``--deny`` value, or None when it was not passed.
+    Both lists are validated before either is written, so a rejectable deny
+    token leaves the file exactly as it was.
     """
     try:
         normalised = scope_mod.normalise_scope(scope_text, allow_any=allow_any)
@@ -308,9 +384,16 @@ def _apply_scope(
         _warn("expected a comma-separated list of hosts, IPs or CIDRs, or 'solo'")
         return "", EXIT_USAGE, False
 
+    try:
+        deny = _normalise_deny(deny_text, allow_any=allow_any)
+    except scope_mod.ScopeError as exc:
+        _warn(f"{exc}")
+        _warn("expected a comma-separated list of hosts, IPs or CIDRs for the deny list")
+        return "", EXIT_USAGE, False
+
     if not write:
         reason = "--dry-run" if dry_run else "--no-write"
-        _out(f"{PROG}: scope -> {normalised} (not written; {reason})")
+        _out(f"{PROG}: scope -> {normalised}{_deny_note(deny)} (not written; {reason})")
         return normalised, EXIT_OK, False
 
     if mcp_path is None:
@@ -323,7 +406,11 @@ def _apply_scope(
 
     try:
         changed = mcpscope.write_scope(
-            mcp_path, normalised, keep_backups=config.backup_keep, dry_run=dry_run
+            mcp_path,
+            normalised,
+            keep_backups=config.backup_keep,
+            dry_run=dry_run,
+            deny=deny,
         )
     except mcpscope.NoPentestServer:
         return _not_recorded(
@@ -337,13 +424,13 @@ def _apply_scope(
 
     if dry_run:
         if changed:
-            _out(f"{PROG}: would record {normalised} in {mcp_path}")
+            _out(f"{PROG}: would record {normalised} in {mcp_path}{_deny_note(deny)}")
         else:
-            _out(f"{PROG}: would leave {mcp_path} at {normalised}")
+            _out(f"{PROG}: would leave {mcp_path} at {normalised}{_deny_note(deny)}")
     elif changed:
-        _out(f"{PROG}: scope {normalised} recorded in {mcp_path}")
+        _out(f"{PROG}: scope {normalised} recorded in {mcp_path}{_deny_note(deny)}")
     else:
-        _out(f"{PROG}: scope already {normalised} in {mcp_path}")
+        _out(f"{PROG}: scope already {normalised} in {mcp_path}{_deny_note(deny)}")
     return normalised, EXIT_OK, True
 
 
@@ -424,11 +511,21 @@ def _cmd_run(args, config: config_mod.Config, problems: list[str]) -> int:
             allow_unscoped=args.allow_unscoped,
             allow_any=args.allow_any,
             dry_run=True,
+            deny_text=args.deny,
         )
         if code != EXIT_OK:
             return code
         _out(f"{PROG}: would launch {config.resolved_kimi_bin()}")
         return EXIT_OK
+
+    # Resolve and check the launcher binary *before* committing the scope, so a
+    # missing Kimi CLI leaves the recorded scope exactly as it was rather than
+    # rewriting `.mcp.json` (possibly wider) for a launch that cannot start.
+    kimi = config.resolved_kimi_bin()
+    if not (Path(kimi).is_file() or shutil.which(kimi)):
+        _warn(f"cannot find the Kimi Code CLI ({kimi!r})")
+        _warn("install it, or set kimi_bin in your config, or export EVILKIT_KIMI_BIN")
+        return EXIT_ERROR
 
     normalised, code, enforced = _apply_scope(
         raw_scope,
@@ -437,15 +534,10 @@ def _cmd_run(args, config: config_mod.Config, problems: list[str]) -> int:
         write=write,
         allow_unscoped=args.allow_unscoped,
         allow_any=args.allow_any,
+        deny_text=args.deny,
     )
     if code != EXIT_OK:
         return code
-
-    kimi = config.resolved_kimi_bin()
-    if not (Path(kimi).is_file() or shutil.which(kimi)):
-        _warn(f"cannot find the Kimi Code CLI ({kimi!r})")
-        _warn("install it, or set kimi_bin in your config, or export EVILKIT_KIMI_BIN")
-        return EXIT_ERROR
 
     _record_launch(
         config,
@@ -507,6 +599,7 @@ def _cmd_scope(args, config: config_mod.Config) -> int:
 
     try:
         current = mcpscope.read_scope(mcp_path)
+        denied = mcpscope.read_deny(mcp_path)
     except mcpscope.McpError as exc:
         _warn(str(exc))
         return EXIT_ERROR
@@ -514,6 +607,10 @@ def _cmd_scope(args, config: config_mod.Config) -> int:
         _warn(f"{mcp_path} declares no pentest server")
         return EXIT_ERROR
     _out(current)
+    # Only when one is recorded: a deny list nobody set must not change this
+    # command's output, which is read back as data by scripts.
+    if denied:
+        _out(f"deny: {denied}")
     return EXIT_OK
 
 
@@ -763,6 +860,7 @@ def _cmd_doctor(config: config_mod.Config, problems: list[str]) -> int:
 def _cmd_theme(args) -> int:
     if args.action == "install":
         edited = theme_mod.is_modified()
+        already = theme_mod.is_installed()
         try:
             target = theme_mod.install(force=args.force)
         except (OSError, ValueError, FileNotFoundError) as exc:
@@ -772,6 +870,12 @@ def _cmd_theme(args) -> int:
             _warn(f"{target} already exists and differs from the bundled theme")
             _warn("re-run with --force to overwrite it")
             return EXIT_ERROR
+        if already and not args.force:
+            # install() left the existing, identical file untouched: report that
+            # honestly rather than claiming a write that did not happen.
+            _out(f"{PROG}: theme already installed at {target} (unchanged)")
+            _out(f"{PROG}: set theme = \"{theme_mod.THEME_NAME}\" in your tui.toml to use it")
+            return EXIT_OK
         _out(f"{PROG}: theme written to {target}")
         _out(f"{PROG}: set theme = \"{theme_mod.THEME_NAME}\" in your tui.toml to use it")
         return EXIT_OK
@@ -813,6 +917,90 @@ def _cmd_config(args, config: config_mod.Config, problems: list[str]) -> int:
     for problem in problems:
         _warn(problem)
     return EXIT_OK
+
+
+def _cmd_agent(args, config: config_mod.Config) -> int:
+    if args.list:
+        configs = agent_mod.builtin_configs()
+        if not configs:
+            _out("no built-in agent configs")
+            return EXIT_OK
+        for path in configs:
+            try:
+                ac = agent_mod.load_config(path)
+                _out(f"{ac.version}-{ac.name}  {path}")
+            except ValueError as exc:
+                _warn(f"{path}: {exc}")
+        return EXIT_OK
+
+    if not args.config:
+        _warn("--config is required (or use --list)")
+        return EXIT_USAGE
+    if not args.target:
+        _warn("--target is required")
+        return EXIT_USAGE
+    if ":" not in args.target:
+        _warn(f"--target must be HOST:PORT, got {args.target!r}")
+        return EXIT_USAGE
+
+    config_path = args.config.expanduser()
+    if not config_path.is_file():
+        _warn(f"config not found: {config_path}")
+        return EXIT_ERROR
+
+    # The agent path launches the Kimi CLI just like `run`, so it must be held to
+    # the same scope gate: enforce the recorded scope, inject it into the child's
+    # environment, and record the launch. Fail closed if there is no scope to
+    # enforce, so an agent run can never reach a target the record never authorised.
+    try:
+        mcp_path = _resolve_mcp_path(args.mcp_json)
+    except mcpscope.McpNotFound as exc:
+        _warn(str(exc))
+        return EXIT_ERROR
+    if mcp_path is None:
+        _warn("no .mcp.json here or in any parent directory; nothing to scope")
+        _warn("record a scope with `evilkit scope set ...` before running the agent")
+        return EXIT_ERROR
+
+    try:
+        recorded = mcpscope.read_scope(mcp_path)
+    except mcpscope.McpError as exc:
+        _warn(f"cannot read the recorded scope from {mcp_path}: {exc}")
+        return EXIT_ERROR
+    if not recorded:
+        _warn(f"{mcp_path} records no scope; set one before running the agent")
+        return EXIT_ERROR
+
+    if not scope_mod.target_in_scope(args.target, recorded):
+        _warn(f"--target {args.target!r} is not within the recorded scope ({recorded})")
+        _warn("widen the scope deliberately with `evilkit scope`, or pick an in-scope target")
+        return EXIT_ERROR
+
+    kimi_env = _launch_env(config, recorded)
+    _record_launch(
+        config,
+        recorded,
+        enforced=True,
+        mcp_path=mcp_path,
+        kimi=config.resolved_kimi_bin(),
+        no_audit=getattr(args, "no_audit", False),
+    )
+    _out(f"{PROG}: authorized scope -> {recorded}")
+
+    try:
+        return agent_mod.run(
+            config_path,
+            args.target,
+            interactive=args.interactive,
+            config=config,
+            env=kimi_env,
+        )
+    except ValueError as exc:
+        _warn(f"invalid agent config: {exc}")
+        return EXIT_ERROR
+    except FileNotFoundError as exc:
+        _warn(str(exc))
+        return EXIT_ERROR
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -858,6 +1046,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_theme(args)
     if args.command == "config":
         return _cmd_config(args, config, problems)
+    if args.command == "agent":
+        return _cmd_agent(args, config)
 
     parser.print_help()
     return EXIT_USAGE

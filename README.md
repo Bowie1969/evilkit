@@ -15,7 +15,8 @@ arguments. It also ships a colour theme for the Kimi Code TUI and a `doctor` com
 The point is the thing you would otherwise forget or mistype: a pentest tool server takes its
 allowed targets from the `env` block of `.mcp.json`, and that block overrides whatever the parent
 shell exported. evilkit writes the file, so the scope is always the one you authorised for this
-session rather than the one left over from last week.
+session rather than the one left over from last week. `--deny` writes the matching denied-target
+list into the same block, for the "everything in this range except this one host" case.
 
 It fails closed. If the requested scope cannot be recorded — there is no `.mcp.json`, the file
 declares no `pentest` server, the file cannot be read, or the write does not succeed — evilkit stops
@@ -52,8 +53,12 @@ From the root of your evilkit checkout:
 ./install.sh
 ```
 
-The script needs `python3`, refuses to run on Python older than 3.11, installs the CLI with `uv` if
-it is present, otherwise `pipx`, otherwise `python3 -m pip install --user`, then copies the colour
+The script needs `python3`, refuses to run on Python older than 3.11, and installs the CLI with `uv`
+if it is present, otherwise `pipx`, otherwise into a private virtual environment at
+`~/.local/share/evilkit/venv`, whose `evilkit` script is linked into `~/.local/bin`. The virtual
+environment is the fallback rather than `python3 -m pip install --user` because a plain `--user`
+install is refused on externally-managed Pythons (Debian, Ubuntu, Parrot) under PEP 668; the `--user`
+path is still used, last, on machines that have no `venv` module either. It then copies the colour
 theme into `~/.kimi-code/themes/` when `~/.kimi-code` exists. It is safe to re-run.
 
 Manual alternatives, if you would rather not use the script:
@@ -230,8 +235,9 @@ Any first argument that is not one of the commands above is treated as an argume
 
 ```console
 $ evilkit run --help
-usage: evilkit run [-h] [-s TARGETS] [--mcp-json PATH] [--no-write] [-y] [-n]
-                   [--allow-unscoped] [--allow-any] [--strict] [--no-audit]
+usage: evilkit run [-h] [-s TARGETS] [--deny TARGETS] [--mcp-json PATH]
+                   [--no-write] [-y] [-n] [--allow-unscoped] [--allow-any]
+                   [--strict] [--no-audit]
 
 Set the authorized scope, then hand over to the Kimi Code CLI.
 
@@ -239,6 +245,9 @@ options:
   -h, --help            show this help message and exit
   -s, --scope TARGETS   comma-separated hosts, IPs or CIDRs; 'solo' for the
                         locked-down default
+  --deny TARGETS        comma-separated targets to refuse even inside the
+                        scope; an empty value denies nothing (omit it to leave
+                        the record alone)
   --mcp-json PATH       path to .mcp.json (default: nearest one at or above
                         the working directory)
   --no-write, --read-only
@@ -260,6 +269,7 @@ here.
 | Flag | Effect |
 |---|---|
 | `-s`, `--scope TARGETS` | Use this scope instead of prompting. Commas separate targets, so quote the value in your shell. |
+| `--deny TARGETS` | Record this as the denied-target list, parsed and normalised exactly like `--scope`, including the range forms. The tool server checks it first, so a target can be inside the scope and still be refused. Omitting the flag leaves whatever deny list is recorded in place. An empty value records "deny nothing" — it is not the `solo` loopback alias. |
 | `--mcp-json PATH` | Record the scope in this file instead of searching upward. A path that does not exist is a fatal error (`exit 1`). |
 | `--no-write`, `--read-only` | Leave `.mcp.json` untouched, only export the environment, and launch. See the limitation below. |
 | `-y`, `--yes` | Never prompt. Also implied when stdin is not a TTY. |
@@ -284,7 +294,7 @@ $ evilkit -- --model kimi-k2       # launches the CLI with --model kimi-k2
 
 | Command | Effect |
 |---|---|
-| `evilkit scope show` | Print the scope currently recorded in the `.mcp.json` evilkit finds. Exits `1` when no file or no `pentest` server is found. |
+| `evilkit scope show` | Print the scope currently recorded in the `.mcp.json` evilkit finds, plus the deny list on a second line when one is recorded. Exits `1` when no file or no `pentest` server is found. |
 | `evilkit scope set TARGETS` | Replace the recorded scope with `TARGETS`. |
 | `evilkit scope add TARGETS` | Add `TARGETS` to the recorded scope. A target already recorded is not repeated. |
 | `evilkit scope remove TARGETS` | Drop `TARGETS` from the recorded scope. Refused when it would leave no target at all. |
@@ -648,12 +658,45 @@ $ echo $?
 2
 ```
 
+### The deny list
+
+`--deny` records a second value in the same `env` block, `PENTEST_DENIED_TARGETS`. The tool server
+checks the deny list first, so a deny entry wins over an allow entry. That is how you authorise a
+whole subnet but refuse one host inside it:
+
+```console
+$ evilkit -s 10.20.30.0/24 --deny 10.20.30.7 -n
+evilkit: would record 10.20.30.0/24 in /srv/engagements/acme/.mcp.json [deny: 10.20.30.7/32]
+evilkit: would launch /home/you/.kimi-code/bin/kimi
+```
+
+It is parsed and normalised by exactly the same rules as `--scope`, the range forms included, so
+`--deny 10.20.30.10-20` expands just as it would as a scope, hostnames are lowercased, and an entry
+that would be rejected as a scope is rejected here too — with `exit 2` and nothing written. The one
+difference in parsing is the empty value, described below.
+
+Two differences from `--scope` are deliberate:
+
+- **Omitting `--deny` changes nothing.** Whatever deny list is recorded stays recorded, so
+  `evilkit -s 10.0.0.0/24` on a project that already denies a host goes on denying it. Only `--deny`
+  replaces the list. The same holds for `scope set`, `add` and `remove`, which never touch it.
+- **An empty `--deny` means "deny nothing", not the `solo` loopback alias.** The aliases (`solo`,
+  `none`, `off`, empty) describe an *allow* scope, where they mean "lock down to loopback". Read the
+  same way, `--deny ""` would have denied loopback itself, which is not what clearing a deny list
+  means.
+
+`evilkit scope show` prints the deny list on a second line when one is recorded, and a `--dry-run`
+names it beside the scope it would write. A change to the deny list alone is a real change: it writes
+the file and takes a backup, exactly as a scope change does.
+
 The write itself:
 
 - The nearest `.mcp.json`, at or above the working directory, is used unless `--mcp-json` says
   otherwise.
-- Only `mcpServers.pentest.env.PENTEST_ALLOWED_TARGETS` is changed. If the file declares no
-  `pentest` server, the run stops with `exit 1` rather than launching unscoped.
+- Two values can change: `mcpServers.pentest.env.PENTEST_ALLOWED_TARGETS`, and
+  `PENTEST_DENIED_TARGETS` when `--deny` is given. Every other key is read, re-serialised and written
+  back unchanged. If the file declares no `pentest` server, the run stops with `exit 1` rather than
+  launching unscoped.
 - A `<name>.lock` file beside the target is locked for the read-modify-write, so two evilkit runs
   against the same project are serialised instead of racing. The lock file is created on first write
   and left in place.
@@ -666,7 +709,9 @@ The write itself:
   rather than overwriting an existing backup.
 - The target keeps its permissions. A `.mcp.json` set to `0600` stays `0600` across a write, rather
   than being reset to the umask on a file that may hold a `PENTEST_TOKEN`.
-- When the value already matches, nothing is written and no backup is created.
+- When both values already match what was asked for, nothing is written and no backup is created. A
+  deny list that changed on its own is not that case: it is written and backed up like any other
+  change.
 - Backups beyond `backup_keep` are deleted, oldest first, ordered by their timestamp and then by
   that suffix, so the newest survive.
 - Input that cannot be read as JSON is reported as a message, not a traceback: invalid UTF-8, invalid
@@ -883,6 +928,8 @@ the binding text. For anything other than the standard terms, contact the copyri
 
 ```bash
 python3 -m pip uninstall evilkit    # or: pipx uninstall evilkit / uv tool uninstall evilkit
+rm -rf ~/.local/share/evilkit       # the virtual environment install.sh may have used
+rm -f ~/.local/bin/evilkit          # the console script, or the link to it
 rm -f ~/.kimi-code/themes/evilkit.json
 rm -rf ~/.config/evilkit
 ```

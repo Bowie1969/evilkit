@@ -1,5 +1,9 @@
 """Read and update the ``pentest`` server scope inside a project's ``.mcp.json``.
 
+Two env keys belong to that scope: ``PENTEST_ALLOWED_TARGETS`` and
+``PENTEST_DENIED_TARGETS``. The tool server checks the deny list first, so a
+target can be inside the allowed scope and still be refused.
+
 The write is atomic: a candidate file is built and parsed before it replaces
 anything, and the previous version is kept as a timestamped backup. A project
 must never be left with a half-written ``.mcp.json``, nor briefly with none.
@@ -29,14 +33,17 @@ __all__ = [
     "McpNotFound",
     "NoPentestServer",
     "SCOPE_ENV_KEY",
+    "DENY_ENV_KEY",
     "find",
     "read_scope",
+    "read_deny",
     "write_scope",
     "prune_backups",
     "looks_like_backup",
 ]
 
 SCOPE_ENV_KEY = "PENTEST_ALLOWED_TARGETS"
+DENY_ENV_KEY = "PENTEST_DENIED_TARGETS"
 SERVER_NAME = "pentest"
 
 _BACKUP_RE = re.compile(r"\.(?P<stamp>\d{8}-\d{6})(?:-(?P<suffix>\d+))?\.bak$")
@@ -80,8 +87,8 @@ def _load(path: Path) -> dict:
     return data
 
 
-def read_scope(path: Path) -> str | None:
-    """Return the configured scope, or None when no pentest server is declared."""
+def _pentest_env(path: Path) -> dict | None:
+    """The pentest server's env block, or None when there is none to read."""
     data = _load(path)
     servers = data.get("mcpServers")
     if not isinstance(servers, dict):
@@ -92,8 +99,30 @@ def read_scope(path: Path) -> str | None:
     env = server.get("env")
     if not isinstance(env, dict):
         return None
-    value = env.get(SCOPE_ENV_KEY)
+    return env
+
+
+def _read_env_key(path: Path, key: str) -> str | None:
+    """Return ``key`` from the pentest env block, or None when it is unset."""
+    env = _pentest_env(path)
+    if env is None:
+        return None
+    value = env.get(key)
     return value if isinstance(value, str) else None
+
+
+def read_scope(path: Path) -> str | None:
+    """Return the configured scope, or None when no pentest server is declared."""
+    return _read_env_key(path, SCOPE_ENV_KEY)
+
+
+def read_deny(path: Path) -> str | None:
+    """Return the configured deny list, or None when none is recorded.
+
+    An empty string is a recorded answer — "deny nothing" — and is returned as
+    such rather than folded into None, which means the key is not there at all.
+    """
+    return _read_env_key(path, DENY_ENV_KEY)
 
 
 def looks_like_backup(path: Path) -> bool:
@@ -175,6 +204,11 @@ def _stage(path: Path, payload: str) -> Path:
             if mode is not None:
                 os.fchmod(fd, mode)
             handle.write(payload)
+            # Flush to disk before the rename: after a crash the record must be
+            # the whole new scope or the whole old one, never a truncated file
+            # that a launcher would then fail to parse.
+            handle.flush()
+            os.fsync(fd)
     except OSError as exc:
         _discard(staging)
         raise McpError(f"could not stage a new {path.name}: {exc}") from exc
@@ -211,21 +245,42 @@ def _locked(path: Path) -> Iterator[None]:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
-def write_scope(path: Path, scope: str, keep_backups: int = 5, dry_run: bool = False) -> bool:
-    """Record ``scope`` in ``path``.
+def write_scope(
+    path: Path,
+    scope: str,
+    keep_backups: int = 5,
+    dry_run: bool = False,
+    deny: str | None = None,
+) -> bool:
+    """Record ``scope``, and ``deny`` when it is given, in ``path``.
+
+    ``deny`` is the denied-target list. ``None`` means the caller said nothing
+    about it, so whatever is recorded stays untouched — an omission must never
+    blank a deny list someone set earlier. A string is recorded as the new
+    value; ``""`` is the explicit "no denied targets".
 
     Returns True when the file changed, False when it already held that scope
-    (in which case nothing is written and no backup is created). With
-    ``dry_run`` the checks run and the answer is the same, but no file is
-    touched.
+    and that deny list (in which case nothing is written and no backup is
+    created). A deny-only change is a change: it writes and backs up like any
+    other. With ``dry_run`` the checks run and the answer is the same, but no
+    file is touched.
     """
     if dry_run:
-        return _rewrite(path, scope, keep_backups, dry_run=True)
+        return _rewrite(path, scope, deny, keep_backups, dry_run=True)
     with _locked(path):
-        return _rewrite(path, scope, keep_backups, dry_run=False)
+        return _rewrite(path, scope, deny, keep_backups, dry_run=False)
 
 
-def _rewrite(path: Path, scope: str, keep_backups: int, *, dry_run: bool) -> bool:
+def _rewrite(
+    path: Path, scope: str, deny: str | None, keep_backups: int, *, dry_run: bool
+) -> bool:
+    # A symlinked target is refused, matching `theme.install`. Replacing it with
+    # the staged regular file would leave the link's real target holding the old
+    # scope, so a session following the link would run under a scope this write
+    # only appeared to change.
+    if path.is_symlink():
+        raise McpError(f"{path} is a symlink; refusing to write the scope through it")
+
     data = _load(path)
 
     servers = data.setdefault("mcpServers", {})
@@ -238,9 +293,17 @@ def _rewrite(path: Path, scope: str, keep_backups: int, *, dry_run: bool) -> boo
     env = server.setdefault("env", {})
     if not isinstance(env, dict):
         raise McpError(f"{path}: '{SERVER_NAME}.env' is not an object")
-    if env.get(SCOPE_ENV_KEY) == scope:
+
+    # Every key that differs, so "nothing to do" is a judgement about all of
+    # them: a deny list that moved on its own still has to be written.
+    changes: dict[str, str] = {}
+    if env.get(SCOPE_ENV_KEY) != scope:
+        changes[SCOPE_ENV_KEY] = scope
+    if deny is not None and env.get(DENY_ENV_KEY) != deny:
+        changes[DENY_ENV_KEY] = deny
+    if not changes:
         return False
-    env[SCOPE_ENV_KEY] = scope
+    env.update(changes)
 
     if dry_run:
         return True
@@ -258,7 +321,7 @@ def _rewrite(path: Path, scope: str, keep_backups: int, *, dry_run: bool) -> boo
         if keep_backups > 0:
             backup = _free_backup_path(path)
             try:
-                shutil.copy2(path, backup)
+                shutil.copy2(path, backup, follow_symlinks=False)
             except OSError as exc:
                 raise McpError(f"could not back up {path}: {exc}") from exc
 
@@ -267,6 +330,16 @@ def _rewrite(path: Path, scope: str, keep_backups: int, *, dry_run: bool) -> boo
         except OSError as exc:
             # The original was copied, never moved, so it is untouched by this.
             raise McpError(f"could not replace {path}: {exc}") from exc
+        # Persist the rename itself, so the durable directory entry points at the
+        # new file and not, after a crash, at a staging name that is already gone.
+        try:
+            dir_fd = os.open(path.parent, os.O_DIRECTORY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass
     except BaseException:
         _discard(staging)
         raise

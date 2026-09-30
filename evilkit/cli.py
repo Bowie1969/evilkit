@@ -28,7 +28,11 @@ EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_USAGE = 2
 
-COMMANDS = ("run", "scope", "log", "watch", "doctor", "theme", "config", "agent", "version")
+#: Findings rows shown in the interactive selection; the JSON file always
+#: holds everything, and --osint-accept matches against the full set.
+OSINT_DISPLAY_LIMIT = 50
+
+COMMANDS = ("run", "osint", "scope", "log", "watch", "doctor", "theme", "config", "agent", "version")
 
 _EPILOG = """\
 examples:
@@ -36,6 +40,8 @@ examples:
   evilkit --scope 10.0.0.0/24        launch against one network
   evilkit -s 10.0.0.5,app.lan -y     non-interactive, two targets
   evilkit -s solo                    accept the locked-down default
+  evilkit run --osint example.com    passive OSINT first, then pick the scope
+  evilkit osint example.com          passive recon only; never launches
   evilkit --no-write -- -c           leave .mcp.json alone, resume a session
   evilkit scope show                 print the scope recorded in .mcp.json
   evilkit scope add 10.0.0.0/24      widen the record by one network
@@ -123,6 +129,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="permit a /0 scope, which authorises every address",
     )
     run.add_argument(
+        "--osint",
+        nargs="*",
+        metavar="SEED",
+        help="run the passive OSINT stage on these seeds first, then choose "
+             "the scope from the findings (interactive)",
+    )
+    run.add_argument(
+        "--osint-accept",
+        metavar="VALUES",
+        help="with --osint: accept exactly these candidates as the scope "
+             "(required instead of the prompt in --yes / non-tty mode)",
+    )
+    run.add_argument(
+        "--no-osint-mcp",
+        action="store_true",
+        help="do not attach the osint MCP server to the launched session",
+    )
+    run.add_argument(
         "--strict",
         action="store_true",
         help="deprecated; an unrecordable scope is already fatal unless --allow-unscoped",
@@ -131,6 +155,33 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-audit",
         action="store_true",
         help="do not append this launch to the local log",
+    )
+    osint_cmd = sub.add_parser(
+        "osint",
+        help="run the passive OSINT stage; never launches anything",
+        description="Passive OSINT recon: public feeds and registries only. "
+                    "Prints findings and writes osint-findings.json; the "
+                    "candidates are only ever scope when you pass them to "
+                    "`run --osint-accept` or pick them in the interactive stage.",
+    )
+    osint_cmd.add_argument(
+        "seeds",
+        nargs="+",
+        metavar="SEED",
+        help="domains, hostnames, emails, usernames, IPs or phone numbers",
+    )
+    osint_cmd.add_argument(
+        "--only", metavar="TOOLS", help="comma-separated subset of tools to run"
+    )
+    osint_cmd.add_argument(
+        "--skip", metavar="TOOLS", help="comma-separated tools to drop"
+    )
+    osint_cmd.add_argument(
+        "--json",
+        dest="json_path",
+        type=Path,
+        metavar="PATH",
+        help="write findings to PATH (default: osint-findings.json here)",
     )
     scope_cmd = sub.add_parser("scope", help="inspect or change the recorded scope")
     scope_sub = scope_cmd.add_subparsers(dest="scope_command", metavar="ACTION")
@@ -488,9 +539,131 @@ def _launch_env(config: config_mod.Config, scope_value: str) -> dict[str, str]:
     return env
 
 
+def _split_tools(text: str | None) -> list[str] | None:
+    if not text:
+        return None
+    return [t for t in text.split(",") if t.strip()]
+
+
+def _osint_stage_and_select(args, config: config_mod.Config) -> int | None:
+    """Run the optional --osint stage and let the operator pick the scope.
+
+    Returns an exit code to bail out with, or None on success once ``args.scope``
+    carries the operator's selection. Findings are never auto-recorded: an
+    interactive run prompts, and --yes / non-tty runs require --osint-accept.
+    """
+    from . import osint as osint_mod
+
+    seeds = list(args.osint)
+    if not seeds:
+        _warn("--osint needs at least one seed (domain, email, username, IP or phone)")
+        return EXIT_USAGE
+
+    interactive = not args.yes and sys.stdin.isatty() and args.osint_accept is None
+    if args.osint_accept is None and not interactive:
+        _warn("--osint chooses the scope interactively; pass --osint-accept \"value1,value2\" "
+              "to run without a prompt")
+        return EXIT_USAGE
+
+    def _event(message: str) -> None:
+        _out(f"{PROG}: osint {message}")
+
+    try:
+        findings = osint_mod.run_stage(
+            seeds,
+            python_bin=config.osint.resolved_python(),
+            script=config.osint.resolved_script(),
+            timeout_each=config.osint.timeout_each,
+            on_event=_event,
+        )
+    except osint_mod.McpConnectionError as exc:
+        _warn(str(exc))
+        _warn("nothing was launched; check `evilkit doctor` and the [osint] config table")
+        return EXIT_ERROR
+
+    findings_path = Path.cwd() / "osint-findings.json"
+    try:
+        osint_mod.write_findings(findings, findings_path)
+        _out(f"{PROG}: osint findings -> {findings_path}")
+    except OSError as exc:
+        _warn(f"osint: could not write {findings_path}: {exc}")
+
+    rows = osint_mod.candidate_table(findings)
+    display = rows[:OSINT_DISPLAY_LIMIT]
+    _out()
+    _out("OSINT findings:")
+    for number, value, kind, sources, eligible in display:
+        suffix = "" if eligible else "   (not scope-eligible)"
+        _out(f"  {number:>3}  {value:<44} {kind:<9} [{sources}]{suffix}")
+    if len(rows) > len(display):
+        _out(f"  ... {len(rows) - len(display)} more candidates in the findings file")
+    _out()
+
+    if args.osint_accept is not None:
+        accept_values = [v.strip() for v in args.osint_accept.split(",") if v.strip()]
+        _out(f"{PROG}: osint --osint-accept -> {args.osint_accept}")
+        by_value: dict[str, tuple] = {}
+        for row in rows:
+            by_value.setdefault(row[1].lower(), row)
+        picks: list[tuple] = []
+        for value in accept_values:
+            row = by_value.get(value.lower())
+            if row is None:
+                _warn(f"osint: {value!r} is not among the findings; skipped")
+                continue
+            picks.append(row)
+    else:
+        try:
+            chosen_text = input(
+                "select scope candidates (numbers or 1,3-5; 'a' = all shown; "
+                "enter = abort)> "
+            )
+        except (EOFError, KeyboardInterrupt):
+            _out()
+            chosen_text = ""
+        _out()
+
+        picked = osint_mod.parse_selection(chosen_text, len(display))
+        if picked is None:
+            _warn("aborted: nothing recorded, nothing launched")
+            return EXIT_ERROR
+        picks = [display[number - 1] for number in picked]
+
+    if not picks:
+        _warn("no valid selection: nothing recorded or launched")
+        return EXIT_ERROR
+
+    values: list[str] = []
+    for number, value, kind, _sources, eligible in picks:
+        if not eligible:
+            _warn(f"candidate {number} ({value}) is data about a person or platform, "
+                  "not something to authorise; skipped")
+            continue
+        try:
+            token = scope_mod.normalise_scope(value)
+        except scope_mod.ScopeError as exc:
+            _warn(f"candidate {number} ({value}) rejected by the scope parser ({exc}); skipped")
+            continue
+        if token not in values:
+            values.append(token)
+
+    if not values:
+        _warn("no valid candidates survived validation: nothing recorded or launched")
+        return EXIT_ERROR
+
+    args.scope = ",".join(values)
+    _out(f"{PROG}: osint selection -> {args.scope}")
+    return None
+
+
 def _cmd_run(args, config: config_mod.Config, problems: list[str]) -> int:
     for problem in problems:
         _warn(problem)
+
+    if getattr(args, "osint", None) is not None:
+        code = _osint_stage_and_select(args, config)
+        if code is not None:
+            return code
 
     raw_scope = _collect_scope(args, config)
 
@@ -501,6 +674,35 @@ def _cmd_run(args, config: config_mod.Config, problems: list[str]) -> int:
         return EXIT_ERROR
 
     write = not args.no_write and config.write_mcp_json
+
+    if getattr(args, "osint", None) is not None and not args.no_osint_mcp:
+        # Attach the passive osint MCP server alongside the recorded scope so
+        # the session itself can run public-source recon mid-run. Additive and
+        # best-effort: a failed attachment warns, it never blocks the launch.
+        attach_dry = bool(args.dry_run or args.no_write or not write)
+        if mcp_path is None:
+            if not attach_dry:
+                _warn("osint: no .mcp.json found; the session will not have the "
+                      "osint MCP server")
+        else:
+            try:
+                changed = mcpscope.ensure_osint_server(
+                    mcp_path,
+                    [config.osint.resolved_python(), config.osint.resolved_script()],
+                    keep_backups=config.backup_keep,
+                    dry_run=attach_dry,
+                )
+            except mcpscope.McpError as exc:
+                _warn(f"osint: could not attach the osint MCP server ({exc}); "
+                      "continuing without it")
+            else:
+                if attach_dry:
+                    state = "add" if changed else "leave"
+                    _out(f"{PROG}: would {state} the osint MCP server in {mcp_path}")
+                elif changed:
+                    _out(f"{PROG}: osint MCP server attached in {mcp_path}")
+                else:
+                    _out(f"{PROG}: osint MCP server already present in {mcp_path}")
 
     if args.dry_run:
         normalised, code, _ = _apply_scope(
@@ -851,10 +1053,69 @@ def _cmd_doctor(config: config_mod.Config, problems: list[str]) -> int:
             else:
                 _out(f"audit log          : {log_path} (last launch {entries[-1].get('at', '?')}{note})")
 
+    osint_python = config.osint.resolved_python()
+    osint_script = config.osint.resolved_script()
+    osint_ok = Path(osint_python).is_file() and Path(osint_script).is_file()
+    _out(f"osint server      : {'available' if osint_ok else 'not installed (optional)'} "
+         f"({osint_script})")
+
     for problem in problems:
         _warn(problem)
 
     return EXIT_OK if ok else EXIT_ERROR
+
+
+def _cmd_osint(args, config: config_mod.Config, problems: list[str]) -> int:
+    """Standalone passive recon: findings only, never a scope, never a launch."""
+    from . import osint as osint_mod
+
+    for problem in problems:
+        _warn(problem)
+
+    def _event(message: str) -> None:
+        _out(f"{PROG}: osint {message}")
+
+    try:
+        findings = osint_mod.run_stage(
+            list(dict.fromkeys(seed.strip() for seed in args.seeds if seed.strip())),
+            python_bin=config.osint.resolved_python(),
+            script=config.osint.resolved_script(),
+            timeout_each=config.osint.timeout_each,
+            only=_split_tools(args.only),
+            skip=_split_tools(args.skip),
+            on_event=_event,
+        )
+    except osint_mod.McpConnectionError as exc:
+        _warn(str(exc))
+        _warn("check `evilkit doctor` and the [osint] table in your config")
+        return EXIT_ERROR
+
+    target = args.json_path if args.json_path is not None else Path.cwd() / "osint-findings.json"
+    try:
+        written = osint_mod.write_findings(findings, target)
+    except OSError as exc:
+        _warn(f"could not write {target}: {exc}")
+        written = None
+
+    rows = osint_mod.candidate_table(findings)
+    display = rows[:OSINT_DISPLAY_LIMIT]
+    _out()
+    _out("OSINT findings (passive public sources only; nothing was probed):")
+    for number, value, kind, sources, eligible in display:
+        suffix = "" if eligible else "   (not scope-eligible)"
+        _out(f"  {number:>3}  {value:<44} {kind:<9} [{sources}]{suffix}")
+    if len(rows) > len(display):
+        _out(f"  ... {len(rows) - len(display)} more candidates in the findings file")
+    eligible_count = sum(1 for row in rows if row[4])
+    _out()
+    if len(findings.get("runs", [])) == 0 and not rows:
+        _warn("no runs planned: check the seeds against `evilkit osint --help`")
+        return EXIT_ERROR
+    _out(f"{len(rows)} candidates ({eligible_count} scope-eligible)")
+    if written is not None:
+        _out(f"{PROG}: findings -> {written}")
+        return EXIT_OK
+    return EXIT_ERROR
 
 
 def _cmd_theme(args) -> int:
@@ -913,6 +1174,9 @@ def _cmd_config(args, config: config_mod.Config, problems: list[str]) -> int:
     resolved_log = _audit_path(config)
     _out(f"audit           = {str(config.audit).lower()}")
     _out(f"audit_path      = {resolved_log}{'' if config.audit_path else ' (default)'}")
+    _out(f"osint python    = {config.osint.python_bin}")
+    _out(f"osint script    = {config.osint.script}")
+    _out(f"osint timeout   = {config.osint.timeout_each:g}")
     _out(f"config file     = {config.source or config_mod.config_path()}")
     for problem in problems:
         _warn(problem)
@@ -1034,6 +1298,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "run":
         return _cmd_run(args, config, problems)
+    if args.command == "osint":
+        return _cmd_osint(args, config, problems)
     if args.command == "scope":
         return _cmd_scope(args, config)
     if args.command == "log":

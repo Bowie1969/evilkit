@@ -16,7 +16,7 @@ from pathlib import Path
 from .mcpscope import SCOPE_ENV_KEY
 from .scope import SOLO_SCOPE, ScopeError, normalise_scope
 
-__all__ = ["Config", "config_dir", "config_path", "load", "save"]
+__all__ = ["Config", "OsintConfig", "config_dir", "config_path", "load", "save"]
 
 APP_NAME = "evilkit"
 
@@ -60,6 +60,26 @@ def config_path() -> Path:
 
 
 @dataclass
+class OsintConfig:
+    """:mod:`evilkit.osint` stage settings. Values may start with ``~``.
+
+    The defaults point at the standalone passive OSINT MCP server; the stage
+    is optional and a missing server must degrade to a clear error, never a
+    launch.
+    """
+
+    python_bin: str = "~/tools/osint-mcp/venv/bin/python"
+    script: str = "~/tools/osint-mcp/server.py"
+    timeout_each: float = 240.0
+
+    def resolved_python(self) -> str:
+        return os.path.expanduser(self.python_bin)
+
+    def resolved_script(self) -> str:
+        return os.path.expanduser(self.script)
+
+
+@dataclass
 class Config:
     """Resolved settings, with every field defaulted to something safe."""
 
@@ -70,6 +90,7 @@ class Config:
     audit: bool = True
     audit_path: str = ""
     extra_env: dict[str, str] = field(default_factory=dict)
+    osint: OsintConfig = field(default_factory=OsintConfig)
 
     #: Populated by :func:`load` so callers can report where settings came from.
     source: Path | None = None
@@ -92,6 +113,32 @@ class Config:
         return found or self.kimi_bin
 
 
+def _coerce_osint(raw: dict, problems: list[str]) -> dict:
+    """Validate the ``[osint]`` table into raw values for OsintConfig."""
+    values: dict = {}
+    known = {"python", "script", "timeout_each"}
+    for key in raw:
+        if key not in known:
+            problems.append(f"unknown [osint] key {key!r} ignored")
+    if "python" in raw:
+        if isinstance(raw["python"], str) and raw["python"].strip():
+            values["python_bin"] = raw["python"].strip()
+        else:
+            problems.append("[osint] python must be a non-empty string")
+    if "script" in raw:
+        if isinstance(raw["script"], str) and raw["script"].strip():
+            values["script"] = raw["script"].strip()
+        else:
+            problems.append("[osint] script must be a non-empty string")
+    if "timeout_each" in raw:
+        value = raw["timeout_each"]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+            problems.append("[osint] timeout_each must be a positive number")
+        else:
+            values["timeout_each"] = float(value)
+    return values
+
+
 def _coerce(raw: dict) -> tuple[dict, list[str]]:
     known = {
         "kimi_bin",
@@ -101,6 +148,7 @@ def _coerce(raw: dict) -> tuple[dict, list[str]]:
         "audit",
         "audit_path",
         "extra_env",
+        "osint",
     }
     values: dict = {}
     problems: list[str] = []
@@ -162,6 +210,12 @@ def _coerce(raw: dict) -> tuple[dict, list[str]]:
             values["extra_env"] = extra
         else:
             problems.append("extra_env must be a table of string values")
+
+    if "osint" in raw:
+        if isinstance(raw["osint"], dict):
+            values["osint"] = OsintConfig(**_coerce_osint(raw["osint"], problems))
+        else:
+            problems.append("[osint] must be a table ([osint] python = ...)")
 
     return values, problems
 
@@ -235,6 +289,14 @@ def dumps(config: Config) -> str:
             f"{_format_key(key)} = {_format_value(val)}"
             for key, val in sorted(config.extra_env.items())
         ]
+    lines += [
+        "",
+        "[osint]",
+        "# Passive OSINT stage: the standalone osint MCP server evilkit drives.",
+        f"python = {_format_value(config.osint.python_bin)}",
+        f"script = {_format_value(config.osint.script)}",
+        f"timeout_each = {config.osint.timeout_each:g}",
+    ]
     return "\n".join(lines) + "\n"
 
 

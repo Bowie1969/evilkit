@@ -195,6 +195,7 @@ Scope-gated launcher for the Kimi Code CLI.
 positional arguments:
   COMMAND
     run          set the scope and launch the Kimi Code CLI (default)
+    osint        run the passive OSINT stage; never launches anything
     scope        inspect or change the recorded scope
     log          list the launches recorded locally
     watch        watch the recorded scope and alarm if it changes
@@ -212,6 +213,8 @@ examples:
   evilkit --scope 10.0.0.0/24        launch against one network
   evilkit -s 10.0.0.5,app.lan -y     non-interactive, two targets
   evilkit -s solo                    accept the locked-down default
+  evilkit run --osint example.com    passive OSINT first, then pick the scope
+  evilkit osint example.com          passive recon only; never launches
   evilkit --no-write -- -c           leave .mcp.json alone, resume a session
   evilkit scope show                 print the scope recorded in .mcp.json
   evilkit scope add 10.0.0.0/24      widen the record by one network
@@ -229,7 +232,7 @@ Any first argument that is not one of the commands above is treated as an argume
 | Flag | Effect |
 |---|---|
 | `-h`, `--help` | Print help and exit `0`. |
-| `-V`, `--version` | Print `evilkit 1.1.0` and exit `0`. |
+| `-V`, `--version` | Print `evilkit 1.2.0` and exit `0`. |
 
 ### `evilkit run`
 
@@ -237,7 +240,8 @@ Any first argument that is not one of the commands above is treated as an argume
 $ evilkit run --help
 usage: evilkit run [-h] [-s TARGETS] [--deny TARGETS] [--mcp-json PATH]
                    [--no-write] [-y] [-n] [--allow-unscoped] [--allow-any]
-                   [--strict] [--no-audit]
+                   [--osint [SEED ...]] [--osint-accept VALUES]
+                   [--no-osint-mcp] [--strict] [--no-audit]
 
 Set the authorized scope, then hand over to the Kimi Code CLI.
 
@@ -258,6 +262,14 @@ options:
   --allow-unscoped      launch even when the requested scope could not be
                         recorded
   --allow-any           permit a /0 scope, which authorises every address
+  --osint [SEED ...]    run the passive OSINT stage on these seeds first, then
+                        choose the scope from the findings (interactive)
+  --osint-accept VALUES
+                        with --osint: accept exactly these candidates as the
+                        scope (required instead of the prompt in --yes / non-
+                        tty mode)
+  --no-osint-mcp        do not attach the osint MCP server to the launched
+                        session
   --strict              deprecated; an unrecordable scope is already fatal
                         unless --allow-unscoped
   --no-audit            do not append this launch to the local log
@@ -270,6 +282,9 @@ here.
 |---|---|
 | `-s`, `--scope TARGETS` | Use this scope instead of prompting. Commas separate targets, so quote the value in your shell. |
 | `--deny TARGETS` | Record this as the denied-target list, parsed and normalised exactly like `--scope`, including the range forms. The tool server checks it first, so a target can be inside the scope and still be refused. Omitting the flag leaves whatever deny list is recorded in place. An empty value records "deny nothing" — it is not the `solo` loopback alias. |
+| `--osint SEED...` | Run the passive OSINT stage on these seeds first, print the findings, and choose the scope from them. See *The OSINT stage*. The selection wins over `-s`. |
+| `--osint-accept VALUES` | With `--osint`: accept exactly these candidate values as the scope instead of prompting. Required in `-y`/non-TTY runs; values must be among the findings. |
+| `--no-osint-mcp` | Skip writing the `mcpServers.osint` entry into `.mcp.json` for this run. |
 | `--mcp-json PATH` | Record the scope in this file instead of searching upward. A path that does not exist is a fatal error (`exit 1`). |
 | `--no-write`, `--read-only` | Leave `.mcp.json` untouched, only export the environment, and launch. See the limitation below. |
 | `-y`, `--yes` | Never prompt. Also implied when stdin is not a TTY. |
@@ -288,6 +303,35 @@ $ evilkit --model kimi-k2
 usage: evilkit [-h] [-V] COMMAND ...
 evilkit: error: unrecognized arguments: --model kimi-k2
 $ evilkit -- --model kimi-k2       # launches the CLI with --model kimi-k2
+```
+
+### `evilkit osint`
+
+Passive recon only. Runs the standalone OSINT MCP server (see *The OSINT stage*) against seeds
+typed on the command line, prints a findings table, and writes `osint-findings.json` in the
+working directory — recording nothing anywhere else and never launching a session.
+
+```console
+$ evilkit osint --help
+usage: evilkit osint [-h] [--only TOOLS] [--skip TOOLS] [--json PATH]
+                     SEED [SEED ...]
+
+Passive OSINT recon: public feeds and registries only. Prints findings and
+writes osint-findings.json; the candidates are only ever scope when you pass
+them to `run --osint-accept` or pick them in the interactive stage.
+
+positional arguments:
+  SEED          domains, hostnames, emails, usernames, IPs or phone numbers
+
+options:
+  -h, --help    show this help message and exit
+  --only TOOLS  comma-separated subset of tools to run
+  --skip TOOLS  comma-separated tools to drop
+  --json PATH   write findings to PATH (default: osint-findings.json here)
+```
+
+```console
+$ evilkit osint example.com --only subfinder,theharvester
 ```
 
 ### `evilkit scope`
@@ -492,15 +536,15 @@ options:
 
 ### `evilkit version`, `-V`, `--version`
 
-All three print `evilkit 1.1.0`.
+All three print `evilkit 1.2.0`.
 
 ### Exit codes
 
 | Code | Meaning |
 |---|---|
 | `0` | Success. The CLI was launched, or the command did what was asked. |
-| `1` | Error: the requested scope could not be recorded (no `.mcp.json`, no `pentest` server, unreadable file, failed write), a missing Kimi Code binary, a `--mcp-json` path that does not exist, `config init` against an existing file, `theme install` against a modified theme file, `evilkit log` against a log it cannot read or that holds no readable line. A dry run exits `1` in the same situations. |
-| `2` | Usage error: the scope was rejected by the parser, or an argument was not recognised. |
+| `1` | Error: the requested scope could not be recorded (no `.mcp.json`, no `pentest` server, unreadable file, failed write), a missing Kimi Code binary, a `--mcp-json` path that does not exist, `config init` against an existing file, `theme install` against a modified theme file, `evilkit log` against a log it cannot read or that holds no readable line, an OSINT stage with an empty or invalid selection, or an osint server that could not be started. A dry run exits `1` in the same situations. |
+| `2` | Usage error: the scope was rejected by the parser, an argument was not recognised, `--osint` was refused where a prompt was impossible, or no OSINT seeds were given. |
 
 ## Configuration
 
@@ -529,6 +573,12 @@ audit = true
 
 # Where that log lives (empty: $XDG_STATE_HOME/evilkit/launches.jsonl).
 audit_path = ""
+
+[osint]
+# Passive OSINT stage: the standalone osint MCP server evilkit drives.
+python = "~/tools/osint-mcp/venv/bin/python"
+script = "~/tools/osint-mcp/server.py"
+timeout_each = 240
 ```
 
 | Key | Default | Effect |
@@ -540,6 +590,9 @@ audit_path = ""
 | `audit` | `true` | Set `false` to launch without appending to the launch log, as if `--no-audit` had been passed on every run. |
 | `audit_path` | `""` | Where the launch log lives. Empty uses `$XDG_STATE_HOME/evilkit/launches.jsonl`, which is `~/.local/state/evilkit/launches.jsonl` by default; a leading `~` in a value you set is expanded. |
 | `[extra_env]` | empty | A table of string values merged into the environment handed to the Kimi Code CLI. It cannot set `PENTEST_ALLOWED_TARGETS`; that entry is dropped and reported. |
+| `[osint] python` | `~/tools/osint-mcp/venv/bin/python` | Interpreter for the passive OSINT MCP server that `evilkit osint` and `run --osint` drive. `~` is expanded at use time. |
+| `[osint] script` | `~/tools/osint-mcp/server.py` | Server entry point passed to that interpreter. |
+| `[osint] timeout_each` | `240` | Per-tool-call timeout in seconds; slower tools bump themselves up (sherlock needs 600). |
 
 A malformed file never stops a launch: every bad key falls back to its default and the run
 continues. Each problem is reported as an `evilkit: ...` warning on stderr — by `evilkit run` before
@@ -723,6 +776,59 @@ The write itself:
 Because the whole file is re-serialised, a first run reformats `.mcp.json` to two-space indentation.
 Existing keys keep their order, but a missing `env` object is appended to the server entry, and any
 formatting you had is not preserved.
+
+## The OSINT stage
+
+The `osint` command and `run --osint` run a **passive** recon stage before any scope is recorded.
+Seeds (a domain, hostname, email, username, IP or phone number) are classified and fed to the
+standalone osint MCP server (`[osint]` in your config; `python`/`script` point at it), which wraps
+third-party data feeds, certificate logs and public registries only: theHarvester, subfinder,
+sherlock, crt.sh, DNS records, whois, urlscan.io, the Wayback Machine, Shodan InternetDB, breach
+databases, phoneinfoga and dnstwist. No stage tool probes a target host beyond what a browser
+request would, and the stage has no scope of its own to grant.
+
+```console
+$ evilkit run --osint acme.example
+evilkit: osint subfinder acme.example ...
+evilkit: osint findings -> osint-findings.json
+
+OSINT findings:
+    1  acme.example                   host      [seed]
+    2  api.acme.example               host      [crtsh,subfinder,dns:A]
+    3  203.0.113.7                    ip        [urlscan]
+    4  ops@acme.example               email     [theharvester]   (not scope-eligible)
+    5  https://github.com/acme        account   [sherlock]       (not scope-eligible)
+
+select scope candidates (numbers or 1,3-5; 'a' = all; enter = abort)> 1,2
+evilkit: osint selection -> acme.example,api.acme.example
+evilkit: osint MCP server attached in .mcp.json
+evilkit: scope acme.example,api.acme.example recorded in .mcp.json
+evilkit: authorized scope -> acme.example,api.acme.example
+```
+
+The properties that make this safe, all enforced in code:
+
+- **Selection is manual.** Findings are only ever *candidates*. Nothing is recorded unless a
+  human picks it: an interactive run prompts, and `--yes`/non-TTY runs refuse `--osint` unless
+  `--osint-accept "value1,value2"` states exactly which candidates become scope.
+- **Person data is never scope.** Emails, usernames, social accounts, breach names and phone
+  numbers are shown as recon context and marked *not scope-eligible*; picking their number
+  warns and skips.
+- **Platform infrastructure is never scope.** A GitHub account found for the operator does not
+  authorise github.com; candidate hosts under a platform domain are ineligible.
+- **The scope gate is unchanged.** Chosen candidates flow through the same `normalise_scope()`
+  parser, the same fail-closed `.mcp.json` recording and the same launch path as `-s`. A choice
+  the parser rejects is dropped, not recorded around.
+- **Passive sources only.** The stage is recon, not enumeration: no port scanning, no
+  brute-forcing, no login attempts.
+
+With `--osint` (and without `--no-osint-mcp`), evilkit also writes a `mcpServers.osint` entry
+into the engagement's `.mcp.json` — the same stdio registration the GLM/Claude setup uses — so
+the launched session can run the same passive tools mid-run; those tools hit third-party feeds,
+not the target, and the pentest server's scope gate still applies to everything else.
+
+OSINT findings on other people's assets are not authorisation. Recon tells you what is there;
+scope you are entitled to attack is a separate decision you record deliberately.
 
 ## Theme
 

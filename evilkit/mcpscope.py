@@ -34,10 +34,13 @@ __all__ = [
     "NoPentestServer",
     "SCOPE_ENV_KEY",
     "DENY_ENV_KEY",
+    "SERVER_NAME",
+    "OSINT_SERVER_NAME",
     "find",
     "read_scope",
     "read_deny",
     "write_scope",
+    "ensure_osint_server",
     "prune_backups",
     "looks_like_backup",
 ]
@@ -45,6 +48,7 @@ __all__ = [
 SCOPE_ENV_KEY = "PENTEST_ALLOWED_TARGETS"
 DENY_ENV_KEY = "PENTEST_DENIED_TARGETS"
 SERVER_NAME = "pentest"
+OSINT_SERVER_NAME = "osint"
 
 _BACKUP_RE = re.compile(r"\.(?P<stamp>\d{8}-\d{6})(?:-(?P<suffix>\d+))?\.bak$")
 
@@ -304,7 +308,11 @@ def _rewrite(
     if not changes:
         return False
     env.update(changes)
+    return _write_staged(path, data, keep_backups, dry_run)
 
+
+def _write_staged(path: Path, data: dict, keep_backups: int, dry_run: bool) -> bool:
+    """Atomically replace ``path`` with ``data`` (caller has already diffed)."""
     if dry_run:
         return True
 
@@ -347,3 +355,33 @@ def _rewrite(
     if keep_backups > 0:
         prune_backups(path, keep_backups)
     return True
+
+
+def ensure_osint_server(
+    path: Path, command: list[str], keep_backups: int = 5, dry_run: bool = False
+) -> bool:
+    """Declare the passive OSINT MCP server in ``path``.
+
+    ``command`` is ``[python, script, ...args]``; the entry mirrors the one the
+    glm-code registration uses. Idempotent (False when already present and
+    identical), additive: the pentest server and every other key are
+    preserved, and the same staged-write/backup machinery as :func:`write_scope`
+    is used.
+    """
+    if not command or not command[0]:
+        raise McpError("osint server command must be [python, script, ...]")
+    desired = {"type": "stdio", "command": command[0], "args": list(command[1:])}
+    if dry_run:
+        data = _load(path)
+        servers = data.get("mcpServers")
+        return not (isinstance(servers, dict) and servers.get(OSINT_SERVER_NAME) == desired)
+
+    with _locked(path):
+        data = _load(path)
+        servers = data.setdefault("mcpServers", {})
+        if not isinstance(servers, dict):
+            raise McpError(f"{path}: 'mcpServers' is not an object")
+        if servers.get(OSINT_SERVER_NAME) == desired:
+            return False
+        servers[OSINT_SERVER_NAME] = desired
+        return _write_staged(path, data, keep_backups, dry_run=False)

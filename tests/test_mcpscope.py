@@ -591,5 +591,60 @@ class TestSymlinkRefusal(McpscopeTestCase):
         self.assertEqual(mcpscope.read_scope(real), "10.0.0.0/24")
 
 
+class TestEnsureOsintServer(McpscopeTestCase):
+    COMMAND = ["/opt/osint/venv/bin/python", "/opt/osint/server.py"]
+
+    def test_adds_the_server_alongside_the_pentest_scope(self):
+        path = self.write_mcp_json(self.pentest_fixture("10.0.0.0/24"))
+        self.assertTrue(mcpscope.ensure_osint_server(path, self.COMMAND))
+        data = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(data["mcpServers"]["osint"],
+                         {"type": "stdio", "command": self.COMMAND[0],
+                          "args": self.COMMAND[1:]})
+        # The pentest server is untouched.
+        self.assertEqual(mcpscope.read_scope(path), "10.0.0.0/24")
+        self.assertEqual(data["mcpServers"]["pentest"]["env"]["OTHER_ENV"], "keep-me")
+        self.assertEqual(len(self.backups()), 1)
+
+    def test_idempotent_when_the_entry_already_matches(self):
+        path = self.write_mcp_json(self.pentest_fixture())
+        mcpscope.ensure_osint_server(path, self.COMMAND)
+        before = path.read_text(encoding="utf-8")
+        self.assertFalse(mcpscope.ensure_osint_server(path, self.COMMAND))
+        self.assertEqual(path.read_text(encoding="utf-8"), before)
+        self.assertEqual(len(self.backups()), 1)  # only the first write
+
+    def test_dry_run_reports_without_writing(self):
+        path = self.write_mcp_json(self.pentest_fixture())
+        self.assertTrue(mcpscope.ensure_osint_server(path, self.COMMAND, dry_run=True))
+        self.assertNotIn("osint", json.loads(path.read_text(encoding="utf-8"))["mcpServers"])
+        self.assertEqual(len(self.backups()), 0)
+
+    def test_dry_run_false_when_already_present(self):
+        path = self.write_mcp_json(self.pentest_fixture())
+        mcpscope.ensure_osint_server(path, self.COMMAND)
+        self.assertFalse(mcpscope.ensure_osint_server(path, self.COMMAND, dry_run=True))
+
+    def test_works_without_a_pentest_server(self):
+        # Additive: the osint entry never requires the pentest server.
+        path = self.write_mcp_json({"mcpServers": {"other": {"command": "x"}}})
+        self.assertTrue(mcpscope.ensure_osint_server(path, self.COMMAND))
+        data = json.loads(path.read_text(encoding="utf-8"))
+        self.assertIn("osint", data["mcpServers"])
+
+    def test_empty_command_is_refused(self):
+        path = self.write_mcp_json(self.pentest_fixture())
+        with self.assertRaises(mcpscope.McpError):
+            mcpscope.ensure_osint_server(path, [])
+
+    def test_a_different_command_is_recorded(self):
+        path = self.write_mcp_json(self.pentest_fixture())
+        mcpscope.ensure_osint_server(path, self.COMMAND)
+        other = ["/elsewhere/python", "/elsewhere/server.py"]
+        self.assertTrue(mcpscope.ensure_osint_server(path, other))
+        data = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(data["mcpServers"]["osint"]["command"], "/elsewhere/python")
+
+
 if __name__ == "__main__":
     unittest.main()

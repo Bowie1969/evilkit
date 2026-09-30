@@ -82,6 +82,78 @@ because those aliases describe an *allow* scope, where "nothing" means "lock dow
 Both lists are validated before either is written, so a deny entry that does not parse leaves the
 file untouched and exits `2`.
 
+One optional step 0 exists: `run --osint SEED...` runs the passive OSINT stage first (the `osint`
+command's recon, below), prints the findings, and requires you to pick scope candidates from them.
+The picks are validated by the same scope parser and then become `--scope` for steps 3–7; nothing is
+recorded until you pick. In `--yes` or non-TTY runs the prompt cannot happen, so `--osint` is refused
+unless `--osint-accept "value1,value2"` states the picks explicitly. Unless `--no-osint-mcp` is
+passed, the same run also writes a `mcpServers.osint` entry beside the recorded scope so the session
+itself can run the passive tools.
+
+## Worked example: the optional OSINT stage
+
+The stage answers one question before you authorise anything: *what can public sources see about
+this seed?* Seeds are typed, not discovered — you hand the stage the domain, email, username, IP or
+phone you are entitled to investigate; it enumerates passively and proposes candidates.
+
+```console
+$ cd /srv/engagements/acme
+$ evilkit osint acme.example --skip wayback_urls
+evilkit: osint subfinder acme.example ...
+evilkit: osint crtsh_certificates acme.example ...
+evilkit: osint findings -> osint-findings.json
+
+OSINT findings (passive public sources only; nothing was probed):
+    1  acme.example                   host      [seed]
+    2  api.acme.example               host      [crtsh,dns:A]
+    3  203.0.113.7                    ip        [urlscan]
+    4  ops@acme.example               email     [theharvester]   (not scope-eligible)
+    5  https://github.com/acme        account   [sherlock]       (not scope-eligible)
+
+3 candidates (2 scope-eligible)
+evilkit: findings -> /srv/engagements/acme/osint-findings.json
+```
+
+The JSON file carries the full picture: every seed, every tool run and its status, the raw output of
+each (capped), and the deduplicated candidate list with `scope_eligible` per candidate. Keep it with
+the engagement — it is the provenance for whatever you authorised next.
+
+To let the recon choose the scope, use `run --osint` and answer the prompt:
+
+```console
+$ evilkit run --osint acme.example
+... findings table ...
+select scope candidates (numbers or 1,3-5; 'a' = all; enter = abort)> 1,2
+evilkit: osint selection -> acme.example,api.acme.example
+evilkit: would add the osint MCP server in /srv/engagements/acme/.mcp.json
+evilkit: would record acme.example,api.acme.example in /srv/engagements/acme/.mcp.json
+$ evilkit run --osint acme.example            # the same, recorded and launched
+```
+
+Scripted runs pass the picks explicitly instead of prompting:
+
+```console
+$ evilkit run --osint acme.example --osint-accept "acme.example,api.acme.example" -y
+```
+
+`--osint-accept` values are candidates by their full text (hosts, IPs, CIDRs); anything not
+scope-eligible or not parseable as a scope token is warned about and skipped, and a selection that
+leaves nothing valid stops the run before any write — exit `1`, nothing recorded, nothing launched.
+
+Boundaries worth restating, because they are enforced rather than promised: the stage never probes a
+target (its sources are third-party feeds), candidates that are data about a person (emails,
+usernames, accounts, breaches, phones) can never become scope, hosts under platform domains can
+never become scope, and findings about somebody else's assets are still not authorisation — the
+selection prompt asks you to authorise what you will attack, so pick only what you are entitled to
+attack. Configuration lives in the `[osint]` table:
+
+```toml
+[osint]
+python = "/home/will_cyber/tools/osint-mcp/venv/bin/python"
+script = "/home/will_cyber/tools/osint-mcp/server.py"
+timeout_each = 240
+```
+
 ## Worked example: preparing an engagement
 
 A project directory needs a `pentest` MCP server before evilkit can do anything useful. The shape it

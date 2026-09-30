@@ -289,6 +289,20 @@ class TestMergeAndFindings(unittest.TestCase):
             self.assertEqual(path, target)
 
 
+class TestSeedSplitting(unittest.TestCase):
+    def test_whitespace_commas_and_mixed(self):
+        from evilkit.cli import _split_seeds
+
+        self.assertEqual(_split_seeds(["acme.example", "api.acme.example"]),
+                         ["acme.example", "api.acme.example"])
+        self.assertEqual(_split_seeds(["a@x.example, b@y.example,"]),
+                         ["a@x.example", "b@y.example"])
+        self.assertEqual(_split_seeds(["a@x.example,b@y.example"]),
+                         ["a@x.example", "b@y.example"])
+        self.assertEqual(_split_seeds(["  ", ",", "x.example,,x.example"]),
+                         ["x.example"])
+
+
 class TestSelectionParsing(unittest.TestCase):
     def test_abort_shapes(self):
         for answer in ("", "   ", "n", "NONE", "q", "abort"):

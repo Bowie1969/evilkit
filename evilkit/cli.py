@@ -545,6 +545,20 @@ def _split_tools(text: str | None) -> list[str] | None:
     return [t for t in text.split(",") if t.strip()]
 
 
+def _split_seeds(raw: list[str]) -> list[str]:
+    """One seed per piece, whether separated by whitespace or commas.
+
+    Both `--osint a.example b.example` and `--osint a@x.example,b@y.example`
+    (and a trailing comma, which shells encourage) must yield clean seeds;
+    commas are never part of a legal seed, unlike the targets in --osint-accept
+    where they separate values.
+    """
+    seeds: list[str] = []
+    for seed in raw:
+        seeds.extend(part.strip() for part in seed.split(",") if part.strip())
+    return list(dict.fromkeys(seeds))
+
+
 def _osint_stage_and_select(args, config: config_mod.Config) -> int | None:
     """Run the optional --osint stage and let the operator pick the scope.
 
@@ -554,7 +568,7 @@ def _osint_stage_and_select(args, config: config_mod.Config) -> int | None:
     """
     from . import osint as osint_mod
 
-    seeds = list(args.osint)
+    seeds = _split_seeds(args.osint)
     if not seeds:
         _warn("--osint needs at least one seed (domain, email, username, IP or phone)")
         return EXIT_USAGE
@@ -1077,7 +1091,7 @@ def _cmd_osint(args, config: config_mod.Config, problems: list[str]) -> int:
 
     try:
         findings = osint_mod.run_stage(
-            list(dict.fromkeys(seed.strip() for seed in args.seeds if seed.strip())),
+            _split_seeds(args.seeds),
             python_bin=config.osint.resolved_python(),
             script=config.osint.resolved_script(),
             timeout_each=config.osint.timeout_each,

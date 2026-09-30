@@ -183,6 +183,12 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="PATH",
         help="write findings to PATH (default: osint-findings.json here)",
     )
+    osint_cmd.add_argument(
+        "--attach",
+        action="store_true",
+        help="also write the osint MCP server into the engagement .mcp.json, "
+             "so the next kimi session here has the recon tools (never launches)",
+    )
     scope_cmd = sub.add_parser("scope", help="inspect or change the recorded scope")
     scope_sub = scope_cmd.add_subparsers(dest="scope_command", metavar="ACTION")
     scope_cmd.set_defaults(
@@ -1132,10 +1138,28 @@ def _cmd_osint(args, config: config_mod.Config, problems: list[str]) -> int:
         _warn("no runs planned: check the seeds against `evilkit osint --help`")
         return EXIT_ERROR
     _out(f"{len(rows)} candidates ({eligible_count} scope-eligible)")
-    if written is not None:
-        _out(f"{PROG}: findings -> {written}")
-        return EXIT_OK
-    return EXIT_ERROR
+    if written is None:
+        return EXIT_ERROR
+
+    if args.attach:
+        mcp_path = _resolve_mcp_path(None)
+        if mcp_path is None:
+            _warn("no .mcp.json here or in any parent directory; nothing to attach to")
+            return EXIT_ERROR
+        try:
+            changed = mcpscope.ensure_osint_server(
+                mcp_path,
+                [config.osint.resolved_python(), config.osint.resolved_script()],
+                keep_backups=config.backup_keep,
+            )
+        except mcpscope.McpError as exc:
+            _warn(f"could not attach the osint MCP server ({exc})")
+            return EXIT_ERROR
+        state = "attached in" if changed else "already attached to"
+        _out(f"{PROG}: osint MCP server {state} {mcp_path}")
+
+    _out(f"{PROG}: findings -> {written}")
+    return EXIT_OK
 
 
 def _cmd_theme(args) -> int:

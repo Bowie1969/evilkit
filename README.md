@@ -314,7 +314,7 @@ working directory — recording nothing anywhere else and never launching a sess
 ```console
 $ evilkit osint --help
 usage: evilkit osint [-h] [--only TOOLS] [--skip TOOLS] [--json PATH]
-                     SEED [SEED ...]
+                     [--attach] SEED [SEED ...]
 
 Passive OSINT recon: public feeds and registries only. Prints findings and
 writes osint-findings.json; the candidates are only ever scope when you pass
@@ -328,11 +328,20 @@ options:
   --only TOOLS  comma-separated subset of tools to run
   --skip TOOLS  comma-separated tools to drop
   --json PATH   write findings to PATH (default: osint-findings.json here)
+  --attach      also write the osint MCP server into the engagement .mcp.json,
+                so the next kimi session here has the recon tools (never
+                launches)
 ```
 
 ```console
 $ evilkit osint example.com --only subfinder,theharvester
 ```
+
+The optional `--attach` is the way to give a Kimi session the recon tools without running the
+`run --osint` stage: it writes the same `mcpServers.osint` entry `run --osint` writes (additive,
+backed up, idempotent) and records nothing else — the scope stays exactly as it was, and nothing
+launches. Attach once per engagement; every later `evilkit run` or plain kimi launch in that
+directory carries the tools.
 
 ### `evilkit scope`
 

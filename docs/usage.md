@@ -88,7 +88,8 @@ The picks are validated by the same scope parser and then become `--scope` for s
 recorded until you pick. In `--yes` or non-TTY runs the prompt cannot happen, so `--osint` is refused
 unless `--osint-accept "value1,value2"` states the picks explicitly. Unless `--no-osint-mcp` is
 passed, the same run also writes a `mcpServers.osint` entry beside the recorded scope so the session
-itself can run the passive tools.
+itself can run the passive tools. To give the session the recon tools without running the stage at
+all, `evilkit osint --attach SEED...` writes that same entry and never launches anything.
 
 ## Worked example: the optional OSINT stage
 

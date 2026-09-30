@@ -11,7 +11,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from _helpers import EvilkitTestCase  # noqa: E402
+from _helpers import EvilkitTestCase, SCOPE_ENV_KEY  # noqa: E402
 
 from evilkit import osint as osint_mod  # noqa: E402
 from evilkit import mcpscope, scope as scope_mod  # noqa: E402
@@ -376,6 +376,49 @@ class TestRunOsintFailClosed(EvilkitTestCase):
                 ["run", "--osint", "acme.example", "--osint-accept", "acme.example", "-n"])
         self.assertEqual(code, 1)
         self.assertIn("osint server exited", err)
+
+
+class TestOsintAttach(EvilkitTestCase):
+    """`evilkit osint --attach` also wires the osint MCP server into .mcp.json."""
+
+    def setUp(self):
+        super().setUp()
+        self.write_mcp_json(self.pentest_fixture("10.0.0.0/24"))
+
+    def _findings(self):
+        return {"stage_version": 1, "timestamp": "t", "seeds": ["acme.example"],
+                "runs": [{"tool": "dns_records", "status": "ok", "summary": None,
+                          "raw": "", "error": None}],
+                "candidates": [{"value": "acme.example", "type": "host",
+                                "sources": ["seed"], "scope_eligible": True}]}
+
+    def test_attach_writes_the_server_next_to_the_pentest_scope(self):
+        with mock.patch.object(osint_mod, "run_stage", return_value=self._findings()):
+            code, out, _err = self.call_main(
+                ["osint", "acme.example", "--json", str(self.tmp / "f.json"), "--attach"])
+        self.assertEqual(code, 0, _err)
+        self.assertIn("osint MCP server attached", out)
+        servers = json.loads(Path(".mcp.json").read_text(encoding="utf-8"))["mcpServers"]
+        self.assertEqual(servers["pentest"]["env"][SCOPE_ENV_KEY], "10.0.0.0/24")
+        self.assertEqual(servers["osint"]["type"], "stdio")
+        self.assertEqual(len(servers["osint"]["args"]), 1)
+
+    def test_attach_without_mcp_json_is_an_error(self):
+        (self.tmp / ".mcp.json").unlink()
+        with mock.patch.object(osint_mod, "run_stage", return_value=self._findings()):
+            code, _out_text, err = self.call_main(
+                ["osint", "acme.example", "--json", str(self.tmp / "f.json"), "--attach"])
+        self.assertEqual(code, 1)
+        self.assertIn(".mcp.json", err)
+
+    def test_plain_osint_never_touches_the_file(self):
+        path = self.tmp / ".mcp.json"
+        before = path.read_bytes()
+        with mock.patch.object(osint_mod, "run_stage", return_value=self._findings()):
+            code, _out_text, _err = self.call_main(
+                ["osint", "acme.example", "--json", str(self.tmp / "f.json")])
+        self.assertEqual(code, 0)
+        self.assertEqual(path.read_bytes(), before)
 
 
 if __name__ == "__main__":

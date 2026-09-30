@@ -662,7 +662,13 @@ def _osint_stage_and_select(args, config: config_mod.Config) -> int | None:
             values.append(token)
 
     if not values:
-        _warn("no valid candidates survived validation: nothing recorded or launched")
+        _warn("nothing picked could be authorised as a scope: nothing recorded or launched")
+        _warn("emails, usernames, phones and breach names are data ABOUT you, not hosts; "
+              "they can never be targets")
+        if picks:
+            _warn(f"your {len(picks)} pick(s) were all in that category; re-run with a domain "
+                  "you own added to the seeds, or skip the OSINT stage and run "
+                  "`evilkit -s <host-You-own>` directly")
         return EXIT_ERROR
 
     args.scope = ",".join(values)

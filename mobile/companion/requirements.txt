@@ -1,0 +1,2 @@
+# evilkit companion server uses only the Python standard library plus the
+# vendored evilkit_core modules in this directory. No pip packages required.

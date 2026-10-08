@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Run this checkout's mesh without replacing an existing evilkit installation.
+set -euo pipefail
+MESH_SOURCE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+export PYTHONPATH="$MESH_SOURCE_DIR${PYTHONPATH:+:$PYTHONPATH}"
+exec python3 -m evilkit mesh "$@"

@@ -105,3 +105,28 @@ credited, and the state machine also refuses a dependent objective (crown needs
 the implant) until its prerequisite is *verified*, not merely attempted.
 Run `mission_contract` first, `mission_declare` before each sensitive step, and
 `mission_status` to see what is still unproven.
+
+## L13 — Re-evaluate objectives after every data pull
+Source: pcap analysis of evilkit-20261004-1511 (vmbr9 capture, 12929 packets)
+The pcap showed successful data exfiltration via relay chain
+(.11->.21:9001->.22:9001->.31:8080) but the agent kept brute-forcing SSH on
+bot01 for 227 more attempts. After ANY data pull that returns sensitive content,
+stop and check: did this meet an objective? If the answer is yes, move to the
+next phase. The harness now forces re-evaluation after every `record_action` and
+injects OBJECTIVE MET or ALL OBJECTIVES MET when appropriate.
+
+## L14 — C2 fallback latency means your first channel may silently fail
+Source: pcap analysis of evilkit-20261004-1511 (stage2 delivery)
+The pcap showed multiple failed stage2 fetches on port 18080 (build hash
+mismatch) before the implant succeeded on port 9080. C2 failover (TCP:14444 ->
+HTTP:18080 -> HTTP:9080) works but adds latency. Do not assume the first
+channel attempt succeeded. Verify with `malware_test` or a beacon check-in
+before proceeding. If the first channel returns an error, the fallback is
+automatic — wait for it rather than retrying manually.
+
+## L15 — Budget is 50 actions, not 100: plan accordingly
+Source: harness v2 post-pcap tightening
+Global action budget dropped from 100 to 50 after the 2026-10-04 run wasted
+~60 turns on redundant SSH brute-force. With 50 actions and 7 phases, you have
+~7 turns per phase. Each turn must advance the mission. If you spend 3 turns on
+auth without success, you are using the wrong credential — harvest a new one.

@@ -40,6 +40,8 @@ from .harness import (
     Objective,
     ProvenanceChecker,
     _extract_technique,
+    _extract_host,
+    _extract_credential,
 )
 from .models import ChatCompletionClient, ChatMessage, ChatRequest
 from .prompts import (
@@ -437,6 +439,8 @@ class Controller:
             tool_call = intention.get("tool")
             expected = intention.get("expected_result", "")
             reasoning = intention.get("reasoning", "")
+            access_claim = intention.get("access_claim")
+            phase = intention.get("phase", 0)
 
             self._say(f"[turn {turn}] operator: {goal}")
             if command:
@@ -445,6 +449,32 @@ class Controller:
                 self._say(f"[turn {turn}] tool: {tool_call.get('name', '')}")
             if reasoning:
                 self._say(f"[turn {turn}] reasoning: {reasoning}")
+            if phase:
+                self._say(f"[turn {turn}] phase: {phase}")
+
+            # Harness: pre-action check (circuit breaker, budget, tool nudge)
+            host = _extract_host(command) if command else ""
+            credential = _extract_credential(command) if command else ""
+            pre_block = self.harness.pre_action_check(
+                host=host, credential=credential, command=command,
+            )
+            if pre_block:
+                self._say(f"[turn {turn}] HARNESS BLOCK: {pre_block}")
+                auditor_feedback = f"HARNESS BLOCKED: {pre_block}"
+                if self.options.trace_path:
+                    _emit_trace(self.options.trace_path, turn, "harness_block", {"message": pre_block})
+                continue
+
+            # Harness: validate access claims
+            if access_claim and isinstance(access_claim, dict):
+                claim_host = access_claim.get("host", "")
+                claim_level = access_claim.get("level", "")
+                if claim_host and claim_level:
+                    prov_block = self.harness.provenance.check_access_claim(claim_host, claim_level, command)
+                    if prov_block:
+                        self._say(f"[turn {turn}] {prov_block}")
+                        auditor_feedback = f"PROVENANCE BLOCK: {prov_block}"
+                        continue
 
             # Trace: operator intention
             if self.options.trace_path:
@@ -452,7 +482,8 @@ class Controller:
                     self.options.trace_path,
                     turn,
                     "intention",
-                    {"goal": goal, "command": command, "tool": tool_call, "expected_result": expected, "reasoning": reasoning},
+                    {"goal": goal, "command": command, "tool": tool_call, "expected_result": expected,
+                     "reasoning": reasoning, "phase": phase, "access_claim": access_claim},
                 )
 
             # Execute command and/or tool
@@ -508,29 +539,23 @@ class Controller:
 
             _update_state_from_output(state, command, raw_output)
 
-            # Harness: pre-action circuit breaker check (for next turn)
-            host = _first_target(command.lower(), "") or ""
-            from .harness import _extract_credential as _extract_cred
-            credential = _extract_cred(command)
-            pre_check = self.harness.pre_action_check(host=host, credential=credential)
-            if pre_check:
-                self._say(f"[turn {turn}] HARNESS BLOCK: {pre_check}")
-
-            # Harness: provenance check on unauthenticated success
-            prov_alert = self.harness.provenance.check_unauthenticated_success(command, raw_output)
-            if prov_alert:
-                self._say(f"[turn {turn}] {prov_alert}")
-
-            # Harness: record action + generate warnings (loop detection, budget, objectives)
+            # Harness: record action + generate warnings (loop, budget, objectives, provenance)
             warnings = self.harness.record_action(
                 turn, command, result.stdout, result.stderr, result.returncode,
-                goal=goal, reasoning=reasoning,
+                goal=goal, reasoning=reasoning, tool_call=tool_call,
             )
             for w in warnings:
                 self._say(f"[turn {turn}] HARNESS: {w}")
 
-            # Harness: check if objectives met — inject stop signal
-            obj_injection = self.harness.check_objectives(raw_output)
+            # Harness: update access level on successful auth
+            if access_claim and isinstance(access_claim, dict):
+                claim_host = access_claim.get("host", "")
+                claim_level = access_claim.get("level", "")
+                if claim_host and claim_level and result.returncode == 0:
+                    self.harness.ledger.set_access_level(claim_host, claim_level)
+
+            # Harness: check if any objective newly met
+            obj_injection = self.harness.check_objectives(raw_output, turn=turn)
             if obj_injection:
                 self._say(f"[turn {turn}] {obj_injection}")
 

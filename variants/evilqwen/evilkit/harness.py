@@ -3,6 +3,16 @@
 The harness owns the canonical facts ledger, checks success after every tool
 result, enforces attempt caps, detects reasoning spirals, and auto-journals
 every command/output/artifact to evidence/ with timestamps.
+
+v2 — rewritten after pcap analysis of the 2026-10-04 pivot range run. Key fixes:
+  - Objective re-evaluation after every data pull (not just final check)
+  - Relay/proxy detection: unauthenticated HTTP returning sensitive data triggers
+    provenance alert and blocks local-FS claims
+  - Tighter attempt budgets: 3 per-cred-per-host (L3), 5 per-host, 50 global
+  - MCP tool enforcement: harness tracks whether the agent uses first-class tools
+    vs raw shell equivalents, and injects nudges
+  - Network truth grounding: TCP path tracking correlated with agent claims
+  - Phase-aware objectives: ordered phases with dependency gates
 """
 
 from __future__ import annotations
@@ -25,59 +35,93 @@ __all__ = [
     "LoopDetector",
     "EvidenceJournal",
     "ProvenanceChecker",
+    "ToolAffordanceTracker",
     "HarnessState",
 ]
 
 
 # ---------------------------------------------------------------------------
-# Objective tracking
+# Objective tracking — phase-aware with dependency gates
 # ---------------------------------------------------------------------------
+
+_PREDICATES = {
+    "crown01_records": lambda raw, ledger: (
+        "/srv/records" in raw
+        and ("payroll" in raw.lower() or "client" in raw.lower() or "financial" in raw.lower())
+        and _has_provenance(ledger, "10.99.50.31")
+    ),
+    "host_discovered": lambda raw, ledger: bool(
+        re.search(r"\b10\.99\.50\.\d{1,3}\b", raw)
+    ),
+    "cred_recovered": lambda raw, ledger: any(
+        marker in raw.lower()
+        for marker in ("password", "credential", "shadow", "id_rsa", "authorized_keys")
+    ),
+    "flag_captured": lambda raw, ledger: bool(
+        re.search(r"flag\{[^}]+\}", raw)
+    ),
+    "ssh_pivot": lambda raw, ledger: (
+        "authenticated" in raw.lower()
+        or "welcome" in raw.lower()
+        or "last login" in raw.lower()
+    ),
+    "relay_chain": lambda raw, ledger: (
+        "chain complete" in raw.lower()
+        or "relay established" in raw.lower()
+    ),
+    "implant_deployed": lambda raw, ledger: (
+        "beacon" in raw.lower()
+        or "check-in" in raw.lower()
+        or "implant active" in raw.lower()
+    ),
+    "data_exfiltrated": lambda raw, ledger: (
+        len(ledger.files_captured) > 0
+        and any(f.get("host") == "10.99.50.31" for f in ledger.files_captured)
+    ),
+}
+
+
+def _has_provenance(ledger: "FactsLedger", host: str) -> bool:
+    """Check if we have a confirmed network path to this host."""
+    return any(
+        np["dst"] == host or np["src"] == host
+        for np in ledger.network_paths
+    )
+
 
 @dataclass
 class Objective:
-    """A machine-readable goal with a success predicate."""
+    """A machine-readable goal with a success predicate and phase dependency."""
     name: str
     description: str
-    success_predicate: str  # human-readable condition
-    check_fn: str  # key in raw_output that proves success
+    success_predicate: str
+    check_fn: str
+    phase: int = 0
+    depends_on: list[str] = field(default_factory=list)
     met: bool = False
     met_at: str = ""
+    evidence_ref: int = -1
 
     def check(self, raw_output: str, ledger: "FactsLedger") -> bool:
-        """Return True when the predicate is satisfied."""
         if self.met:
             return True
-        if self.check_fn == "crown01_records":
-            # Look for evidence of /srv/records content from crown01
-            if "/srv/records" in raw_output and ("payroll" in raw_output.lower() or "client" in raw_output.lower()):
-                self.met = True
-                self.met_at = _utc_now_iso()
-                return True
-        elif self.check_fn == "host_discovered":
-            # Check if the target host is in the ledger
-            if self.name.lower() in raw_output.lower():
-                ip_match = re.search(r"\b\d{1,3}(?:\.\d{1,3}){3}\b", raw_output)
-                if ip_match:
-                    self.met = True
-                    self.met_at = _utc_now_iso()
-                    return True
-        elif self.check_fn == "cred_recovered":
-            if "password" in raw_output.lower() or "credential" in raw_output.lower():
-                self.met = True
-                self.met_at = _utc_now_iso()
-                return True
-        elif self.check_fn == "flag_captured":
-            if re.search(r"flag\{[^}]+\}", raw_output):
-                self.met = True
-                self.met_at = _utc_now_iso()
-                return True
-        elif self.check_fn == "custom":
-            # Generic: the predicate text appears in output
+        predicate = _PREDICATES.get(self.check_fn)
+        if predicate and predicate(raw_output, ledger):
+            self.met = True
+            self.met_at = _utc_now_iso()
+            return True
+        if self.check_fn == "custom":
             if self.success_predicate.lower() in raw_output.lower():
                 self.met = True
                 self.met_at = _utc_now_iso()
                 return True
         return False
+
+    def deps_met(self, all_objectives: list["Objective"]) -> bool:
+        if not self.depends_on:
+            return True
+        by_name = {o.name: o for o in all_objectives}
+        return all(by_name.get(d, Objective(name=d, description="", success_predicate="", check_fn="")).met for d in self.depends_on)
 
 
 # ---------------------------------------------------------------------------
@@ -91,9 +135,10 @@ class FactsLedger:
     creds: list[dict] = field(default_factory=list)
     flags: list[dict] = field(default_factory=list)
     files_captured: list[dict] = field(default_factory=list)
-    file_hashes: dict[str, str] = field(default_factory=dict)  # path -> sha256
-    network_paths: list[dict] = field(default_factory=list)  # actual TCP routes
+    file_hashes: dict[str, str] = field(default_factory=dict)
+    network_paths: list[dict] = field(default_factory=list)
     findings: list[dict] = field(default_factory=list)
+    access_levels: dict[str, str] = field(default_factory=dict)
 
     def add_host(self, address: str, hostname: str = "", services: list | None = None, source: str = "") -> None:
         existing = next((h for h in self.hosts if h["address"] == address), None)
@@ -105,9 +150,12 @@ class FactsLedger:
                 "source": source,
                 "discovered_at": _utc_now_iso(),
             })
+        elif services:
+            for svc in services:
+                if svc not in existing.get("services", []):
+                    existing.setdefault("services", []).append(svc)
 
     def add_cred(self, host: str, username: str, password: str, source: str = "") -> None:
-        key = f"{host}:{username}"
         existing = next((c for c in self.creds if c["host"] == host and c["username"] == username), None)
         if not existing:
             self.creds.append({
@@ -132,7 +180,7 @@ class FactsLedger:
         """Record a captured file. Returns False if already captured (same hash)."""
         h = hashlib.sha256(content.encode()).hexdigest()
         if path in self.file_hashes and self.file_hashes[path] == h:
-            return False  # already captured
+            return False
         self.file_hashes[path] = h
         self.files_captured.append({
             "path": path,
@@ -144,17 +192,37 @@ class FactsLedger:
         return True
 
     def add_network_path(self, src: str, dst: str, port: int, protocol: str = "tcp") -> None:
-        entry = {"src": src, "dst": dst, "port": port, "protocol": protocol, "recorded_at": _utc_now_iso()}
-        if entry not in self.network_paths:
-            self.network_paths.append(entry)
+        key = (src, dst, port, protocol)
+        existing = any(
+            (np["src"], np["dst"], np["port"], np["protocol"]) == key
+            for np in self.network_paths
+        )
+        if not existing:
+            self.network_paths.append({
+                "src": src, "dst": dst, "port": port, "protocol": protocol,
+                "recorded_at": _utc_now_iso(),
+            })
+
+    def set_access_level(self, host: str, level: str) -> None:
+        """Track the proven access level per host.
+        Levels: discovered < readable < authenticated < executable < writable < root
+        """
+        _LEVELS = {"discovered": 0, "readable": 1, "authenticated": 2, "executable": 3, "writable": 4, "root": 5}
+        current = self.access_levels.get(host, "discovered")
+        if _LEVELS.get(level, 0) > _LEVELS.get(current, 0):
+            self.access_levels[host] = level
+
+    def hosts_at_level(self, min_level: str) -> list[str]:
+        _LEVELS = {"discovered": 0, "readable": 1, "authenticated": 2, "executable": 3, "writable": 4, "root": 5}
+        min_ord = _LEVELS.get(min_level, 0)
+        return [h for h, lv in self.access_levels.items() if _LEVELS.get(lv, 0) >= min_ord]
 
     def summary(self) -> str:
-        lines = [
-            f"HOSTS: {len(self.hosts)}",
-        ]
+        lines = [f"HOSTS: {len(self.hosts)}"]
         for h in self.hosts:
             svcs = ", ".join(f"{s.get('port', '?')}/{s.get('protocol', '?')}" for s in h.get("services", []))
-            lines.append(f"  {h['address']} ({h.get('hostname', '?')}) [{svcs or 'no services'}]")
+            level = self.access_levels.get(h["address"], "discovered")
+            lines.append(f"  {h['address']} ({h.get('hostname', '?')}) [{svcs or 'no services'}] access={level}")
         lines.append(f"CREDENTIALS: {len(self.creds)}")
         for c in self.creds:
             lines.append(f"  {c['username']}@{c['host']} ({c['source']})")
@@ -178,42 +246,55 @@ class FactsLedger:
             "file_hashes": self.file_hashes,
             "network_paths": self.network_paths,
             "findings": self.findings,
+            "access_levels": self.access_levels,
         }
 
 
 # ---------------------------------------------------------------------------
-# Attempt budgets & circuit breakers
+# Attempt budgets & circuit breakers — tighter defaults from pcap analysis
 # ---------------------------------------------------------------------------
 
 @dataclass
 class AttemptBudget:
-    """Per-host/per-service/per-credential attempt caps enforced by the harness."""
-    max_per_host_auth: int = 5       # failed auths per host before hard-lock
-    max_per_service_auth: int = 3    # failed auths per service before hard-lock
-    max_per_cred_per_host: int = 3   # L3: same (host, cred) pair before cred lock
-    max_global_actions: int = 100    # total action budget
-    max_per_technique: int = 15      # per-technique budget (e.g. brute-force)
+    """Per-host/per-service/per-credential attempt caps enforced by the harness.
+
+    Defaults tightened after the 2026-10-04 run where 227 SSH attempts hit bot01
+    with zero success. The L3 per-(host, cred) cap fires first, so a credential
+    that fails 3x is locked before the host cap kicks in.
+    """
+    max_per_host_auth: int = 5
+    max_per_service_auth: int = 3
+    max_per_cred_per_host: int = 3
+    max_global_actions: int = 50
+    max_per_technique: int = 10
+    max_consecutive_failures: int = 5
 
     host_attempts: dict[str, int] = field(default_factory=dict)
     service_attempts: dict[str, int] = field(default_factory=dict)
     cred_attempts: dict[str, int] = field(default_factory=dict)
     technique_counts: dict[str, int] = field(default_factory=dict)
     total_actions: int = 0
+    consecutive_failures: int = 0
     locked_vectors: list[str] = field(default_factory=list)
     locked_creds: list[str] = field(default_factory=list)
 
-    def record_action(self, technique: str = "") -> None:
+    def record_action(self, technique: str = "", succeeded: bool = True) -> list[str]:
+        warnings = []
         self.total_actions += 1
         if technique:
             self.technique_counts[technique] = self.technique_counts.get(technique, 0) + 1
+        if succeeded:
+            self.consecutive_failures = 0
+        else:
+            self.consecutive_failures += 1
+            if self.consecutive_failures >= self.max_consecutive_failures:
+                warnings.append(
+                    f"FAILURE STREAK: {self.consecutive_failures} consecutive failures — "
+                    f"stop and replan strategy."
+                )
+        return warnings
 
     def record_auth_attempt(self, host: str, service: str = "", credential: str = "") -> str | None:
-        """Record an auth attempt. Returns a lock message if cap exceeded, else None.
-
-        L3 graduation: a per-(host, credential) cap fires BEFORE the per-host cap, so a
-        single credential that fails N times against one host is hard-locked while the
-        host itself remains open to other credentials.
-        """
         self.host_attempts[host] = self.host_attempts.get(host, 0) + 1
         key = f"{host}:{service}" if service else host
         self.service_attempts[key] = self.service_attempts.get(key, 0) + 1
@@ -223,19 +304,21 @@ class AttemptBudget:
             self.cred_attempts[cred_key] = self.cred_attempts.get(cred_key, 0) + 1
             if self.cred_attempts[cred_key] >= self.max_per_cred_per_host:
                 msg = (f"CRED LOCK: credential '{credential}' failed "
-                       f"{self.cred_attempts[cred_key]}× on {host} — "
+                       f"{self.cred_attempts[cred_key]}x on {host} — "
                        f"stop retrying this cred here (L3). Harvest a new cred or pivot.")
                 if cred_key not in self.locked_creds:
                     self.locked_creds.append(cred_key)
                 return msg
 
         if self.host_attempts[host] >= self.max_per_host_auth:
-            msg = f"AUTH LOCK: {host} — {self.host_attempts[host]} failed attempts, no cred exists here, pivot."
-            self.locked_vectors.append(key)
+            msg = f"AUTH LOCK: {host} — {self.host_attempts[host]} failed attempts, pivot."
+            if key not in self.locked_vectors:
+                self.locked_vectors.append(key)
             return msg
         if service and self.service_attempts[key] >= self.max_per_service_auth:
-            msg = f"AUTH LOCK: {key} — {self.service_attempts[key]} failed attempts, no cred exists here, pivot."
-            self.locked_vectors.append(key)
+            msg = f"AUTH LOCK: {key} — {self.service_attempts[key]} failed attempts, pivot."
+            if key not in self.locked_vectors:
+                self.locked_vectors.append(key)
             return msg
         return None
 
@@ -251,9 +334,13 @@ class AttemptBudget:
     def technique_exhausted(self, technique: str) -> bool:
         return self.technique_counts.get(technique, 0) >= self.max_per_technique
 
+    def budget_remaining(self) -> int:
+        return max(0, self.max_global_actions - self.total_actions)
+
     def summary(self) -> str:
         lines = [
-            f"ACTION BUDGET: {self.total_actions}/{self.max_global_actions}",
+            f"ACTION BUDGET: {self.total_actions}/{self.max_global_actions} (remaining: {self.budget_remaining()})",
+            f"CONSECUTIVE FAILURES: {self.consecutive_failures}/{self.max_consecutive_failures}",
             f"LOCKED VECTORS: {', '.join(self.locked_vectors) or 'none'}",
             f"LOCKED CREDS: {', '.join(self.locked_creds) or 'none'}",
         ]
@@ -273,10 +360,9 @@ class CircuitBreaker:
         self.budget = budget
 
     def check(self, host: str, service: str = "", technique: str = "", credential: str = "") -> str | None:
-        """Return a lock message if the vector should be blocked, else None."""
         if host and credential and self.budget.is_cred_locked(host, credential):
             return (f"CIRCUIT BREAKER: credential '{credential}' is cred-locked on {host} "
-                    f"(L3: same cred failed ≥{self.budget.max_per_cred_per_host}×) — "
+                    f"(L3: same cred failed >={self.budget.max_per_cred_per_host}x) — "
                     f"use a different credential or pivot.")
         if technique and self.budget.technique_exhausted(technique):
             return f"CIRCUIT BREAKER: technique '{technique}' exhausted ({self.budget.max_per_technique} attempts) — replan strategy."
@@ -285,6 +371,8 @@ class CircuitBreaker:
         key = f"{host}:{service}" if service else host
         if self.budget.is_locked(key):
             return f"CIRCUIT BREAKER: {key} is hard-locked — pivot to another vector."
+        if self.budget.consecutive_failures >= self.budget.max_consecutive_failures:
+            return f"CIRCUIT BREAKER: {self.budget.consecutive_failures} consecutive failures — replan strategy."
         return None
 
 
@@ -297,13 +385,13 @@ class LoopDetector:
     """Detects reasoning spirals and command repetition."""
     recent_commands: list[str] = field(default_factory=list)
     recent_thoughts: list[str] = field(default_factory=list)
+    recent_goals: list[str] = field(default_factory=list)
     max_window: int = 7
     ngram_size: int = 3
     last_action_time: float = field(default_factory=time.time)
-    stall_timeout: int = 120  # seconds without a tool call
+    stall_timeout: int = 120
 
     def record_command(self, cmd: str) -> list[str]:
-        """Record a command and return warnings if repetition detected."""
         self.recent_commands.append(cmd)
         if len(self.recent_commands) > self.max_window:
             self.recent_commands = self.recent_commands[-self.max_window:]
@@ -315,8 +403,20 @@ class LoopDetector:
             self.recent_thoughts = self.recent_thoughts[-self.max_window:]
         return self._check_thought_repetition()
 
+    def record_goal(self, goal: str) -> list[str]:
+        """Track goal repetition — a spinning agent restates the same goal."""
+        self.recent_goals.append(goal.lower().strip())
+        if len(self.recent_goals) > self.max_window:
+            self.recent_goals = self.recent_goals[-self.max_window:]
+        warnings = []
+        if len(self.recent_goals) >= 3 and len(set(self.recent_goals[-3:])) == 1:
+            warnings.append(
+                f"GOAL REPETITION: identical goal stated 3x: '{self.recent_goals[-1][:60]}...' — "
+                f"change vector or declare blocked."
+            )
+        return warnings
+
     def check_stall(self) -> str | None:
-        """Return a stall warning if no action emitted within timeout."""
         elapsed = time.time() - self.last_action_time
         if elapsed > self.stall_timeout:
             return f"STALL WATCHDOG: {int(elapsed)}s without a tool call — emit one concrete action or declare blocked."
@@ -330,12 +430,8 @@ class LoopDetector:
         cmds = self.recent_commands
         if len(cmds) < 3:
             return warnings
-
-        # Exact repetition
         if len(set(cmds[-3:])) == 1:
             warnings.append(f"REPETITION: identical command repeated 3x: {cmds[-1][:60]}...")
-
-        # N-gram similarity
         if len(cmds) >= self.ngram_size:
             ngrams = []
             for i in range(len(cmds) - self.ngram_size + 1):
@@ -343,7 +439,6 @@ class LoopDetector:
                 ngrams.append(ngram)
             if len(ngrams) != len(set(ngrams)):
                 warnings.append(f"REPETITION: similar command pattern repeated (n={self.ngram_size})")
-
         return warnings
 
     def _check_thought_repetition(self) -> list[str]:
@@ -351,7 +446,6 @@ class LoopDetector:
         thoughts = self.recent_thoughts
         if len(thoughts) < 3:
             return warnings
-        # Simple: check for identical thought prefixes
         prefixes = [t[:80] for t in thoughts[-5:]]
         if len(set(prefixes)) == 1:
             warnings.append("REPETITION: identical reasoning pattern repeated — demand a different vector.")
@@ -371,7 +465,6 @@ class EvidenceJournal:
         self.evidence_dir.mkdir(parents=True, exist_ok=True)
 
     def record(self, turn: int, kind: str, data: dict) -> Path:
-        """Write one evidence entry. Returns the file path."""
         ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
         filename = f"turn-{turn:03d}-{kind}-{ts}.json"
         path = self.evidence_dir / filename
@@ -408,7 +501,6 @@ class EvidenceJournal:
         return path
 
     def build_report_skeleton(self, ledger: FactsLedger, objectives: list[Objective]) -> str:
-        """Assemble the report skeleton from current evidence."""
         lines = [
             "# Engagement Report",
             f"Generated: {_utc_now_iso()}",
@@ -417,79 +509,101 @@ class EvidenceJournal:
         ]
         for obj in objectives:
             status = "MET" if obj.met else "PENDING"
-            lines.append(f"- [{status}] {obj.name}: {obj.description}")
+            deps = f" (depends: {', '.join(obj.depends_on)})" if obj.depends_on else ""
+            lines.append(f"- [{status}] {obj.name}: {obj.description}{deps}")
 
         lines += ["", "## Facts Ledger", "", ledger.summary(), ""]
-
         lines += ["## Findings", ""]
         for f in ledger.findings:
             lines.append(f"- [{f.get('severity', 'info')}] {f.get('title', 'unknown')} on {f.get('host', '?')}")
-
         lines += ["", "## Evidence Files", ""]
         for p in sorted(self.evidence_dir.glob("*")):
             lines.append(f"- `{p.name}`")
-
         return "\n".join(lines) + "\n"
 
 
 # ---------------------------------------------------------------------------
-# Provenance checker
+# Provenance checker — enhanced relay detection from pcap analysis
 # ---------------------------------------------------------------------------
 
 class ProvenanceChecker:
-    """Correlates agent actions with network truth; flags suspicious provenance."""
+    """Correlates agent actions with network truth; flags suspicious provenance.
+
+    Enhanced after the 2026-10-04 run where the agent got data from crown01 via
+    a relay chain (.11->.21:9001->.22:9001->.31:8080) but claimed local FS access.
+    """
 
     def __init__(self, ledger: FactsLedger) -> None:
         self.ledger = ledger
+        self.relay_suspects: set[str] = set()
 
-    def check_unauthenticated_success(self, command: str, raw_output: str) -> str | None:
-        """On unauthenticated success (plain GET returning files, open dir listing),
-        auto-raise a 'suspect relay/proxy, not local FS' prompt."""
+    def check_unauthenticated_success(self, command: str, raw_output: str, claimed_host: str = "") -> str | None:
         lower_cmd = command.lower()
         lower_out = raw_output.lower()
 
-        # Detect plain HTTP GET returning file listings or data
-        if ("curl" in lower_cmd or "wget" in lower_cmd or "http" in lower_cmd):
-            if any(marker in lower_out for marker in [
-                "directory", "index of", "parent directory",
-                "payroll", "client", "financial", "records",
-            ]):
-                # Check if this came through a known pivot path
-                pivot_hosts = {h["address"] for h in self.ledger.hosts
-                              if any("pivot" in s.get("name", "").lower() or "proxy" in s.get("name", "").lower()
-                                     for s in h.get("services", []))}
-                if pivot_hosts:
+        is_http = any(kw in lower_cmd for kw in ("curl", "wget", "http", "requests"))
+        has_sensitive = any(marker in lower_out for marker in (
+            "directory", "index of", "parent directory",
+            "payroll", "client", "financial", "records",
+            "password", "shadow", "id_rsa", "private key",
+        ))
+
+        if is_http and has_sensitive:
+            port_match = re.search(r":(\d{4,5})", command)
+            port_str = f" on port {port_match.group(1)}" if port_match else ""
+            if claimed_host:
+                self.relay_suspects.add(claimed_host)
+            return (
+                f"PROVENANCE ALERT: unauthenticated HTTP success returned sensitive data{port_str}. "
+                f"This is likely a relay/proxy, NOT local FS access on the target. "
+                f"Confirm the actual serving host before claiming filesystem access. "
+                f"Use malware_harvest or SSH to verify."
+            )
+
+        if is_http and not has_sensitive and raw_output and len(raw_output) > 500:
+            port_match = re.search(r":(\d{4,5})", command)
+            if port_match:
+                port = int(port_match.group(1))
+                if port in (9001, 9080, 18080):
                     return (
-                        f"PROVENANCE ALERT: unauthenticated HTTP success returned sensitive data. "
-                        f"Suspect relay/proxy via {', '.join(pivot_hosts)}, not local FS — confirm the serving host."
+                        f"PROVENANCE NOTE: traffic on port {port} may be a relay/proxy service. "
+                        f"Data obtained this way came THROUGH a proxy, not from local FS."
                     )
+        return None
+
+    def check_access_claim(self, claimed_host: str, claimed_level: str, command: str) -> str | None:
+        """Reject inflated access claims that aren't supported by evidence."""
+        _ESCALATION_MAP = {
+            "readable": {"curl", "wget", "http"},
+            "authenticated": {"ssh", "sshpass", "netexec", "nxc"},
+            "executable": {"ssh", "bash", "sh", "python3"},
+            "root": {"sudo", "pkexec", "su"},
+        }
+        required_tools = _ESCALATION_MAP.get(claimed_level, set())
+        if required_tools and not any(t in command.lower() for t in required_tools):
+            if claimed_host in self.relay_suspects:
                 return (
-                    "PROVENANCE ALERT: unauthenticated HTTP success returned sensitive data. "
-                    "Suspect relay/proxy, not local FS — confirm the serving host."
+                    f"PROVENANCE BLOCK: {claimed_host} is a relay suspect. "
+                    f"Cannot claim '{claimed_level}' access via relay. "
+                    f"Establish direct SSH/exec access first."
                 )
         return None
 
     def correlate_network_path(self, src: str, dst: str, port: int) -> str:
-        """Ground 'where did this really come from' in the TCP path."""
-        path_str = f"{src} -> {dst}:{port}"
         self.ledger.add_network_path(src, dst, port)
-        # Build the full chain from ledger
         chain = self._build_chain(dst)
         if chain:
             return f"NETWORK TRUTH: actual TCP path: {' -> '.join(chain)}"
-        return f"NETWORK TRUTH: direct {path_str}"
+        return f"NETWORK TRUTH: direct {src} -> {dst}:{port}"
 
     def _build_chain(self, target: str) -> list[str] | None:
-        """Walk network_paths backwards from target to find the full chain."""
-        # Simple backward walk
         visited = set()
         chain = [target]
         current = target
-        for _ in range(10):  # max depth
+        for _ in range(10):
             if current in visited:
                 break
             visited.add(current)
-            # Find a path ending at current
             for np in self.ledger.network_paths:
                 if np["dst"] == current and np["src"] not in visited:
                     chain.insert(0, np["src"])
@@ -498,6 +612,66 @@ class ProvenanceChecker:
             else:
                 break
         return chain if len(chain) > 1 else None
+
+
+# ---------------------------------------------------------------------------
+# Tool affordance tracker — nudge toward MCP tools
+# ---------------------------------------------------------------------------
+
+_TOOL_EQUIVALENTS: dict[str, str] = {
+    "grep.*password": "malware_harvest",
+    "cat.*/etc/shadow": "malware_harvest",
+    "cat.*id_rsa": "malware_harvest",
+    "cat.*authorized_keys": "malware_harvest",
+    "find.*-name.*pass": "malware_harvest",
+    "ssh-keyscan": "malware_map_trust",
+    "cat.*ssh/config": "malware_map_trust",
+    "cat.*known_hosts": "malware_map_trust",
+    "searchsploit": "malware_vuln_research",
+    "sshpass": "netexec (nxc)",
+    r"for.*in.*ssh": "malware_worm",
+    "crontab": "malware_persist",
+    "echo.*cron": "malware_persist",
+    r"curl.*loop": "ffuf or nuclei",
+    r"while.*curl": "ffuf or nuclei",
+}
+
+
+class ToolAffordanceTracker:
+    """Detect when the agent shells out instead of using first-class MCP tools."""
+
+    def __init__(self) -> None:
+        self.nudges_given: dict[str, int] = {}
+        self.mcp_calls: int = 0
+        self.shell_calls: int = 0
+
+    def check_command(self, command: str) -> str | None:
+        self.shell_calls += 1
+        for pattern, tool in _TOOL_EQUIVALENTS.items():
+            if re.search(pattern, command, re.IGNORECASE):
+                self.nudges_given[tool] = self.nudges_given.get(tool, 0) + 1
+                count = self.nudges_given[tool]
+                if count <= 2:
+                    return (
+                        f"TOOL NUDGE: use `{tool}` MCP tool instead of raw shell. "
+                        f"MCP tools are scope-gated and evidence-aware."
+                    )
+                else:
+                    return (
+                        f"TOOL ENFORCEMENT: you have been nudged {count}x to use `{tool}`. "
+                        f"Raw shell bypass is being logged. Use the MCP tool."
+                    )
+        return None
+
+    def record_mcp_call(self, tool_name: str) -> None:
+        self.mcp_calls += 1
+
+    def ratio_summary(self) -> str:
+        total = self.mcp_calls + self.shell_calls
+        if total == 0:
+            return "TOOL USAGE: no actions yet"
+        mcp_pct = (self.mcp_calls / total) * 100
+        return f"TOOL USAGE: {self.mcp_calls} MCP / {self.shell_calls} shell ({mcp_pct:.0f}% MCP)"
 
 
 # ---------------------------------------------------------------------------
@@ -514,7 +688,9 @@ class HarnessState:
     loop_detector: LoopDetector = field(default_factory=LoopDetector)
     evidence_journal: EvidenceJournal | None = None
     provenance: ProvenanceChecker | None = None
+    tool_tracker: ToolAffordanceTracker = field(default_factory=ToolAffordanceTracker)
     objective_met_injection: str = ""
+    _last_objective_check_turn: int = -1
 
     def __post_init__(self) -> None:
         if self.evidence_journal is None:
@@ -523,88 +699,142 @@ class HarnessState:
             self.provenance = ProvenanceChecker(self.ledger)
         self.circuit_breaker = CircuitBreaker(self.budget)
 
-    def check_objectives(self, raw_output: str) -> str | None:
-        """Check all objectives. Return injection message if any newly met."""
+    def check_objectives(self, raw_output: str, turn: int = -1) -> str | None:
+        """Check all objectives after every action. Return injection if any newly met."""
+        newly_met = []
         for obj in self.objectives:
-            if not obj.met and obj.check(raw_output, self.ledger):
-                return f"OBJECTIVE MET — {obj.name}: {obj.description}. Stop or justify continuing."
+            if not obj.met and obj.deps_met(self.objectives) and obj.check(raw_output, self.ledger):
+                obj.evidence_ref = turn
+                newly_met.append(obj)
+
+        if newly_met:
+            names = ", ".join(o.name for o in newly_met)
+            pending = [o for o in self.objectives if not o.met]
+            if not pending:
+                return (
+                    f"ALL OBJECTIVES MET — {names} completed. "
+                    f"Stop and declare completion. Do not continue attacking."
+                )
+            return (
+                f"OBJECTIVE MET — {names}. "
+                f"Remaining: {', '.join(o.name for o in pending)}. "
+                f"Re-evaluate strategy before next action."
+            )
         return None
 
-    def pre_action_check(self, host: str = "", service: str = "", technique: str = "", credential: str = "") -> str | None:
-        """Run circuit breaker + budget checks before allowing an action."""
+    def pre_action_check(self, host: str = "", service: str = "", technique: str = "",
+                         credential: str = "", command: str = "") -> str | None:
         cb = self.circuit_breaker.check(host, service, technique, credential=credential)
         if cb:
             return cb
         if self.budget.is_exhausted():
             return "BUDGET EXHAUSTED: global action limit reached — force strategy replan."
+        if command:
+            nudge = self.tool_tracker.check_command(command)
+            if nudge:
+                return nudge
         return None
 
     def record_action(self, turn: int, command: str, stdout: str, stderr: str, returncode: int,
-                      goal: str = "", reasoning: str = "") -> list[str]:
-        """Record an action and return any warnings generated."""
+                      goal: str = "", reasoning: str = "", tool_call: dict | None = None) -> list[str]:
         warnings = []
 
-        # Budget
-        self.budget.record_action(technique=_extract_technique(command))
+        succeeded = returncode == 0
+        technique = _extract_technique(command) if command else ""
+        if tool_call:
+            technique = f"mcp_{tool_call.get('name', 'unknown')}"
+            self.tool_tracker.record_mcp_call(tool_call.get("name", ""))
 
-        # Auth attempt tracking (host + credential-aware for L3)
-        if _is_auth_command(command):
+        budget_warnings = self.budget.record_action(technique=technique, succeeded=succeeded)
+        warnings.extend(budget_warnings)
+
+        if command and _is_auth_command(command):
             host = _extract_host(command)
             credential = _extract_credential(command)
-            # Only count attempts that FAILED. On the brain path we don't yet have a
-            # reliable success classifier for every auth command, so key off common
-            # failure signatures in stdout/stderr; if neither is present and
-            # returncode != 0, treat as failure. This keeps a successful first-try
-            # login from being counted toward the L3 cred cap.
             combined = f"{stdout}\n{stderr}".lower()
             failure_signals = (
                 "permission denied", "authentication failure", "failed password",
                 "access denied", "login incorrect", "invalid credentials",
-                "connection closed by authenticating user",
+                "connection closed by authenticating user", "no route to host",
+                "connection refused", "connection timed out",
             )
-            succeeded = returncode == 0 and not any(s in combined for s in failure_signals)
-            if not succeeded:
+            auth_succeeded = returncode == 0 and not any(s in combined for s in failure_signals)
+            if not auth_succeeded:
                 lock_msg = self.budget.record_auth_attempt(
                     host=host, credential=credential,
                 )
                 if lock_msg:
                     warnings.append(lock_msg)
+            else:
+                if host:
+                    self.ledger.set_access_level(host, "authenticated")
 
-        # Loop detection
         self.loop_detector.touch()
-        warnings.extend(self.loop_detector.record_command(command))
+        warnings.extend(self.loop_detector.record_command(command or str(tool_call)))
         if reasoning:
             warnings.extend(self.loop_detector.record_thought(reasoning))
+        if goal:
+            warnings.extend(self.loop_detector.record_goal(goal))
 
-        # Stall check
         stall = self.loop_detector.check_stall()
         if stall:
             warnings.append(stall)
 
-        # Evidence journal
         if self.evidence_journal:
-            self.evidence_journal.record_command(turn, command, stdout, stderr, returncode)
+            self.evidence_journal.record_command(turn, command or str(tool_call), stdout, stderr, returncode)
 
-        # Objective check
-        obj_msg = self.check_objectives(stdout)
+        raw_output = stdout + "\n" + stderr if stderr else stdout
+
+        if command:
+            prov_alert = self.provenance.check_unauthenticated_success(command, raw_output)
+            if prov_alert:
+                warnings.append(prov_alert)
+
+        obj_msg = self.check_objectives(raw_output, turn=turn)
         if obj_msg:
             warnings.append(obj_msg)
 
         return warnings
 
     def inject_context(self, state_summary: str = "") -> str:
-        """Build enriched context injection for the operator."""
         parts = []
+
+        met_objs = [o for o in self.objectives if o.met]
+        pending_objs = [o for o in self.objectives if not o.met]
+        if met_objs or pending_objs:
+            obj_lines = ["OBJECTIVES:"]
+            for o in met_objs:
+                obj_lines.append(f"  [MET] {o.name}: {o.description} (at {o.met_at})")
+            for o in pending_objs:
+                deps = f" (needs: {', '.join(o.depends_on)})" if o.depends_on else ""
+                deps_ok = "ready" if o.deps_met(self.objectives) else "blocked"
+                obj_lines.append(f"  [PENDING/{deps_ok}] {o.name}: {o.description}{deps}")
+            parts.append("\n".join(obj_lines))
+
         if self.ledger.hosts or self.ledger.creds or self.ledger.flags:
             parts.append(f"FACTS LEDGER:\n{self.ledger.summary()}")
+
         if self.budget.total_actions > 0:
             parts.append(f"BUDGET:\n{self.budget.summary()}")
-        met_objs = [o.name for o in self.objectives if o.met]
-        pending_objs = [o.name for o in self.objectives if not o.met]
-        if met_objs or pending_objs:
-            parts.append(f"OBJECTIVES: met={met_objs}, pending={pending_objs}")
+
+        parts.append(self.tool_tracker.ratio_summary())
+
+        if self.budget.locked_vectors or self.budget.locked_creds:
+            lock_lines = ["LOCKED (do NOT retry):"]
+            for v in self.budget.locked_vectors:
+                lock_lines.append(f"  vector: {v}")
+            for c in self.budget.locked_creds:
+                lock_lines.append(f"  cred: {c}")
+            parts.append("\n".join(lock_lines))
+
+        if self.provenance.relay_suspects:
+            parts.append(
+                f"RELAY SUSPECTS (do NOT claim local FS): {', '.join(self.provenance.relay_suspects)}"
+            )
+
         if state_summary:
             parts.append(f"STATE: {state_summary}")
+
         return "\n\n".join(parts) if parts else ""
 
 
@@ -617,7 +847,6 @@ def _utc_now_iso() -> str:
 
 
 def _extract_technique(command: str) -> str:
-    """Crude technique extraction from command."""
     lower = command.lower()
     if "nmap" in lower:
         return "nmap_scan"
@@ -637,12 +866,17 @@ def _extract_technique(command: str) -> str:
         return "password_crack"
     if "ping" in lower:
         return "icmp_recon"
+    if "hydra" in lower or "medusa" in lower:
+        return "brute_force"
     return "other"
 
 
 def _is_auth_command(command: str) -> bool:
     lower = command.lower()
-    return any(x in lower for x in ["ssh", "sshpass", "netexec", "nxc", "login", "spray", "crack", "hashcat", "john"])
+    return any(x in lower for x in [
+        "ssh", "sshpass", "netexec", "nxc", "login",
+        "spray", "crack", "hashcat", "john", "hydra", "medusa",
+    ])
 
 
 def _extract_host(command: str) -> str:
@@ -651,29 +885,16 @@ def _extract_host(command: str) -> str:
 
 
 _CRED_PATTERNS = (
-    # sshpass -p 'pw' ssh user@host
     (re.compile(r"sshpass\s+-p\s+['\"]?([^'\"\s]+)['\"]?\s+ssh\s+(?:-[^\s]+\s+)*([A-Za-z0-9._\-]+)@"), "{1}:{0}"),
-    # ssh user@host  (user only; cred == username, password unknown)
     (re.compile(r"\bssh\s+(?:-[^\s]+\s+)*([A-Za-z0-9._\-]+)@\d"), "{0}"),
-    # nxc/netexec PROTO HOST -u user -p pass
     (re.compile(r"\b(?:nxc|netexec)\s+\S+\s+\S+(?:\s+-\S+\s+\S+)*?\s+-u\s+([^\s]+)\s+-p\s+['\"]?([^'\"\s]+)['\"]?"), "{0}:{1}"),
-    # curl -u user:pass
     (re.compile(r"\bcurl\b[^|]*?\s+-u\s+['\"]?([^'\"\s:]+):([^'\"\s]+)['\"]?"), "{0}:{1}"),
-    # hydra/medusa -l user -p pass
     (re.compile(r"\b(?:hydra|medusa|patator)\b[^|]*?\s+-l\s+([^\s]+)\s+-p\s+([^\s]+)"), "{0}:{1}"),
-    # smbclient //host/share -U user%pass
     (re.compile(r"-U\s+['\"]?([^'\"\s%]+)%([^'\"\s]+)['\"]?"), "{0}:{1}"),
 )
 
 
 def _extract_credential(command: str) -> str:
-    """Best-effort credential identifier from a command. '' if nothing recognisable.
-
-    Returns 'user:pass' when both known, 'user' when only the username is visible
-    (ssh with key auth or agent). The identifier is only used as a dict key for
-    the L3 per-(host, cred) cap, so collisions on 'user' alone are the intended
-    behaviour — the operator should not keep retrying the same username either.
-    """
     for pattern, template in _CRED_PATTERNS:
         match = pattern.search(command)
         if match:

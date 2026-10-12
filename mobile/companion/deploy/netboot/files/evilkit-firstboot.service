@@ -1,0 +1,15 @@
+[Unit]
+Description=evilkit first-boot identity setup
+# Run once, before the companion/tunnel, to give this device a unique identity.
+DefaultDependencies=no
+After=local-fs.target
+Before=ssh.service sshd.service sysinit.target
+ConditionPathExists=!/var/lib/evilkit-firstboot.done
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/evilkit-companion/firstboot.sh
+
+[Install]
+WantedBy=sysinit.target

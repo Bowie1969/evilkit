@@ -1,0 +1,38 @@
+#!/usr/sbin/nft -f
+# Default-drop inbound firewall for the evilkit drop device.
+# Rendered to /etc/nftables.conf and loaded by nftables.service.
+#
+# Intent: the companion API (@@COMPANION_PORT@@/tcp) is reachable ONLY over the
+# WireGuard interface (@@WG_IFACE@@). On the target-facing interface the drop
+# sits on, nothing inbound is accepted except established replies. Outbound is
+# open so WireGuard can dial home and tools can reach authorised targets.
+
+flush ruleset
+
+table inet filter {
+    chain input {
+        type filter hook input priority 0; policy drop;
+
+        ct state established,related accept
+        ct state invalid drop
+        iif "lo" accept
+
+        # ICMP (diagnostics) -- trim if you want the drop fully silent.
+        ip protocol icmp accept
+        ip6 nexthdr icmpv6 accept
+
+        # Management + API only over the tunnel.
+        iifname "@@WG_IFACE@@" tcp dport { 22, @@COMPANION_PORT@@ } accept
+
+        # WireGuard handshakes arrive as UDP replies (established), so no
+        # inbound listener rule is needed for the tunnel itself.
+    }
+
+    chain forward {
+        type filter hook forward priority 0; policy drop;
+    }
+
+    chain output {
+        type filter hook output priority 0; policy accept;
+    }
+}

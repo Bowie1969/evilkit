@@ -583,13 +583,22 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     data_dir = Path(args.data_dir)
-    token = args.token or secrets.token_urlsafe(32)
+    # Precedence: --token flag, then COMPANION_TOKEN in the environment (so a
+    # systemd EnvironmentFile can supply it without exposing it in argv/ps),
+    # then a freshly generated random token.
+    provided = args.token or os.environ.get("COMPANION_TOKEN")
+    token = provided or secrets.token_urlsafe(32)
     store = Store(data_dir=data_dir, token=token)
 
     handler_cls = _build_handler(store)
     server = ThreadingHTTPServer((args.host, args.port), handler_cls)
     _log.info("evilkit companion server listening on http://%s:%s", args.host, args.port)
-    _log.info("authorization token: %s", token)
+    if provided:
+        # Don't write a configured token into the log (it lands on persistent
+        # storage); the operator who set it already has it.
+        _log.info("authorization token: supplied via %s", "flag" if args.token else "environment")
+    else:
+        _log.info("authorization token (auto-generated): %s", token)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

@@ -1,0 +1,83 @@
+# evilkit netboot deploy configuration
+# ---------------------------------------------------------------------------
+# Copy to deploy.conf and fill in. deploy.conf is gitignored and is the ONLY
+# place your environment-specific values live. Secrets (WireGuard keys, the
+# companion bearer token) are NOT set here -- gen-secrets.sh writes them into
+# ./secrets/ which is also gitignored. Keep this file and ./secrets/ off any
+# shared storage.
+#
+# Every script in this directory sources this file. Run them in order:
+#   ./gen-secrets.sh            # once, generates ./secrets/
+#   sudo ./10-build-nfsroot.sh  # extract Pi OS Lite arm64 into the NFS root
+#   sudo ./20-provision-root.sh # chroot: user, tools, companion, units, WG
+#   sudo ./30-configure-netboot.sh  # populate the TFTP tree from the root
+# then set the Pi 4 EEPROM boot order per 40-eeprom-bootorder.md.
+# ---------------------------------------------------------------------------
+
+# ---- Identity -------------------------------------------------------------
+# Hostname baked into the image.
+PI_HOSTNAME="evilkit-drop-01"
+
+# Pi 4 serial number (last 8 hex digits, lowercase). The Pi 4 bootloader
+# requests its TFTP files from a directory named by this serial unless you set
+# TFTP_PREFIX=0 in the EEPROM config. Find it with `vcgencmd otp_dump` (look at
+# 28:), from `cat /proc/cpuinfo` (Serial: last 8), or from your TFTP server's
+# request log on first boot. Leave blank to use a flat (non-serial) TFTP root
+# and set TFTP_SERIAL_DIR=0 below.
+PI_SERIAL="00000000"
+TFTP_SERIAL_DIR=1   # 1 = files live under $TFTP_ROOT/$PI_SERIAL ; 0 = flat
+
+# ---- Boot server paths (on THIS machine) ----------------------------------
+# Where the Pi OS Lite arm64 image is downloaded/cached.
+IMG_CACHE_DIR="/srv/evilkit/cache"
+# Official Pi OS Lite arm64 image URL (verify the latest; pin a known one).
+PIOS_IMG_URL="https://downloads.raspberrypi.com/raspios_lite_arm64/images/raspios_lite_arm64-2024-11-19/2024-11-19-raspios-bookworm-arm64-lite.img.xz"
+# Optional: expected sha256 of the .img.xz (strongly recommended). Blank = skip.
+PIOS_IMG_SHA256=""
+
+# The NFS-exported root filesystem the Pi mounts as / .
+NFS_ROOT="/srv/nfs/evilkit-pi"
+# The TFTP root the Pi fetches firmware + kernel + cmdline/config from.
+TFTP_ROOT="/srv/tftp"
+
+# ---- Network boot wiring ---------------------------------------------------
+# IP of THIS boot server as the Pi will reach it (NFS + TFTP live here).
+BOOT_SERVER_IP="192.168.50.1"
+# NFS version to mount (3 is the most trouble-free for Pi netboot).
+NFS_VERS="3"
+
+# ---- WireGuard call-home ---------------------------------------------------
+# The Pi dials OUT to this endpoint on boot. Reachable from wherever the Pi is
+# dropped (public IP / DDNS of your control node, and its listening port).
+WG_ENDPOINT_HOST="vpn.example.com"
+WG_ENDPOINT_PORT="51820"
+# Your control node's WireGuard PUBLIC key (the peer the Pi talks to).
+WG_PEER_PUBLIC_KEY="PASTE_CONTROL_NODE_PUBLIC_KEY"
+# Addressing inside the tunnel.
+WG_IFACE="wg0"
+WG_PI_ADDRESS="10.9.0.2/32"      # the Pi's tunnel IP
+WG_ALLOWED_IPS="10.9.0.0/24"     # what the Pi routes into the tunnel
+WG_KEEPALIVE="25"                # seconds; keeps NAT open from behind the drop
+# DNS to use while the tunnel is up (blank = leave resolv.conf alone).
+WG_DNS=""
+
+# ---- Companion server ------------------------------------------------------
+COMPANION_PORT="8787"
+# Bind the companion to the WireGuard address ONLY, so the target LAN the drop
+# sits on can never reach the API. Must match the address part of WG_PI_ADDRESS.
+COMPANION_BIND="10.9.0.2"
+# Persistent data dir (sessions + audit JSONL). On netboot this lives inside
+# NFS_ROOT, i.e. on this boot server -- that is where the audit trail persists.
+COMPANION_DATA_DIR="/var/lib/evilkit-companion"
+# Default scope seeded for convenience. The operator still sets real scope
+# per session via the API; this is only the fail-closed starting value.
+COMPANION_DEFAULT_SCOPE="127.0.0.1/32"
+
+# ---- Access ----------------------------------------------------------------
+# Path to the SSH public key authorised for the 'evilkit' operator account.
+SSH_AUTHORIZED_KEY_FILE="./secrets/operator_ed25519.pub"
+
+# ---- Tool bundle versions (ARM64) -----------------------------------------
+NUCLEI_VERSION="3.3.5"
+FFUF_VERSION="2.1.0"
+TESTSSL_VERSION="3.2.0"

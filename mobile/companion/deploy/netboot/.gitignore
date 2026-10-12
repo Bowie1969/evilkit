@@ -1,0 +1,4 @@
+# Never commit environment-specific config or secrets.
+deploy.conf
+secrets/
+files/dropper/install.sh

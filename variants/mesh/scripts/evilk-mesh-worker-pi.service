@@ -1,0 +1,29 @@
+[Unit]
+Description=Evilkit mesh Pi worker (pulls tasks from the Parrot hub)
+Documentation=file:///opt/evilk-mesh/README.md
+After=network-online.target wg-quick@wg0.service
+Wants=network-online.target wg-quick@wg0.service
+
+[Service]
+Type=simple
+User=evilk
+WorkingDirectory=/opt/evilk-mesh
+EnvironmentFile=/etc/evilk-mesh/worker.env
+ExecStart=/usr/bin/python3 /opt/evilk-mesh/mesh_worker_pi.py \
+    --leader ${EVILK_MESH_LEADER} \
+    --token-file ${EVILK_MESH_TOKEN_FILE} \
+    --name ${EVILK_MESH_NAME} \
+    --project ${EVILK_MESH_PROJECT} \
+    --spool ${EVILK_MESH_SPOOL}
+Restart=always
+RestartSec=5
+
+# The Pi has no persistent storage worth trusting; keep the worker contained.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/opt/evilk-mesh /var/lib/evilk-mesh
+
+[Install]
+WantedBy=multi-user.target

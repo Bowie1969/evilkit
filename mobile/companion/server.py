@@ -264,7 +264,6 @@ def _tool_verify_http(session: Session, args: dict[str, Any], job: Job) -> list[
 def _tool_port_scan(session: Session, args: dict[str, Any], job: Job) -> list[str]:
     target = str(args.get("target", "")).strip()
     ports = str(args.get("ports", "top-1000")).strip()
-    timing = str(args.get("timing", "T3")).strip()
     timeout = int(args.get("timeout", 300))
 
     if not target:
@@ -273,19 +272,12 @@ def _tool_port_scan(session: Session, args: dict[str, Any], job: Job) -> list[st
     allowed, denied = _parse_scope(session.scope, session.deny)
     _validate_target(target, allowed, denied)
 
-    cmd = ["nmap", f"-{timing}"]
+    cmd = ["rustscan", "-a", target]
     if ports == "top-1000":
-        cmd.append("--top-ports")
-        cmd.append("1000")
+        cmd.append("--top")
     elif ports:
         cmd.append("-p")
         cmd.append(ports)
-    cmd.append("--max-rtt-timeout")
-    cmd.append("1s")
-    cmd.append("--host-timeout")
-    cmd.append(f"{timeout}s")
-    cmd.append("--")
-    cmd.append(target)
     _spawn_stream(cmd, job, timeout=timeout + 10)
     return cmd
 
@@ -309,14 +301,13 @@ TOOLS: dict[str, Tool] = {
     ),
     "port_scan": Tool(
         name="port_scan",
-        description="Run an nmap port scan against a target host.",
+        description="Run a rustscan TCP port scan against a target host.",
         schema={
             "type": "object",
             "required": ["target"],
             "properties": {
                 "target": {"type": "string", "description": "Host or IP to scan"},
                 "ports": {"type": "string", "default": "top-1000", "description": "Ports or 'top-1000'"},
-                "timing": {"type": "string", "default": "T3"},
                 "timeout": {"type": "integer", "default": 300},
             },
         },

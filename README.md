@@ -1,9 +1,29 @@
-# evilkit
+# EvilKit
 
-A scope-gated launcher for the Kimi Code CLI.
+An evidence-first, scope-gated control plane for authorized AI security
+testing. EvilKit gives Kimi Code, Qwen Code, Keystone telemetry, and explicitly
+enrolled lab workers one auditable operating layer.
 
-<!-- TODO(owner): replace with the live Gumroad product URL -->
-**[Buy evilkit](https://gumroad.com/l/REPLACE-ME)** — per-seat licence, includes updates.
+> **Status:** source-available research alpha. Use only on systems you have
+> written permission to test. See the [commercial licence](LICENSE) and
+> [security policy](SECURITY.md).
+
+[Executive brief for Baidam Solutions](docs/baidam-solutions-brief.md) ·
+[Run evidence](docs/runs/README.md) ·
+[Operator guide](docs/usage.md) ·
+[Architecture and demo](docs/baidam-solutions-brief.md#ten-minute-demo)
+
+## Measured evidence
+
+| Run | Operational result | Evaluation status | What it proved |
+|---|---:|---|---|
+| Keystone 6 | 68/110; 68/79 reachable points | Valid operational baseline | Three verified footholds, four running workers, scope-gated evidence in 18.7 minutes |
+| Keystone 7 | 68/110 | Invalid as a cold-start benchmark | Broader compromise, but stale state and harness leakage exposed measurement weaknesses |
+
+The second result is as important as the first: EvilKit records enough detail
+to distinguish system capability from benchmark contamination. The published
+reports retain the analysis and timeline; raw transcripts stay private because
+they contain lab credentials and operator infrastructure.
 
 evilkit records two things — the authorized target scope, in the right place, and a line in a local
 launch log — then hands over to the Kimi Code CLI. On each launch it collects a scope from
@@ -79,6 +99,124 @@ python3 -m evilkit --help
 ```
 
 ## Quick start
+
+The consolidated commands are available from one install:
+
+```console
+$ evilkit hooks install --engine all
+$ evilkit kimi --scope 10.99.50.0/24 --dashboard-run-dir ~/Projects/keystone-range/runs/RUN_ID
+$ evilkit qwen --scope 10.99.50.0/24 --dashboard-run-dir ~/Projects/keystone-range/runs/RUN_ID
+$ evilkit dashboard status --run-dir ~/Projects/keystone-range/runs/RUN_ID
+```
+
+Both CLI adapters use the same scope doctrine, hook journal, reversible learning
+ledger, and Keystone bridge. The bridge appends sanitized visualization events
+to `dashboard/events.jsonl`, canonical action/session records to `journal.jsonl`,
+and merges its own fields into `dashboard/status.json` — it does not replace that
+file, which also holds the run's identity and the `started` anchor the board's
+run clock counts from. It is disabled unless a concrete run directory is
+supplied, so one run cannot silently contaminate another.
+
+### Putting the run on the board, from inside it
+
+A session that reports to the board can also drive it. With a dashboard URL
+configured, the launch declares a `dashboard` MCP server and the operator gets
+four tools:
+
+| tool | what it does |
+|---|---|
+| `start_run` | the board's **Start run**: marks the newest prepared run as the one being tracked, so the board leaves the live-brain view. Refused while another run is tracked |
+| `stop_run` | the board's **Stop**: marks the tracked run finished, so the live-brain view returns |
+| `end_run` | finishes *this* run's own record — `state = "finished"` in the bound run's status file. Works whether or not the board is tracking it |
+| `run_status` | reads the board's control state (read-only) |
+
+Those tools run the board's own fixed scripts (`keystone-range/bin/{start,stop}.sh`),
+and the scripts are **bookkeeping** (`keystone/run_control.py`): they update a
+prepared run's dashboard status. They do not launch or tear down the range, they
+do not start or stop an operator session, and no tool here puts traffic on a
+target.
+
+```toml
+[dashboard]
+url = "http://dashboard.example.test:8793"  # empty attaches nothing
+attach = true                        # declare the server on every kimi/qwen launch
+auto = true                          # put this run on the board, take it off at exit
+timeout = 5.0                        # seconds per control request
+```
+
+`--attach-dashboard` declares the server for one launch, `--no-dashboard-mcp`
+suppresses it together with the automation, and `--dry-run`/`--no-write` report
+without writing. The entry goes in the file the CLI actually reads —
+`<project>/.kimi-code/mcp.json`, else the user-level one (the Qwen adapter uses
+the project `.mcp.json`) — never a plain `.mcp.json`, which the Kimi CLI ignores.
+
+With `auto`, the launcher asks the board whether a run is already being tracked:
+if none is, it starts tracking before the session and stops tracking when the
+session ends — but only if that launch is what started it, so another session's
+run is never taken off the board by someone else's exit. `--no-supervise` leaves
+no process behind to stop it, and the launch says so. Each control call is
+journaled into the run as `kind = "control"`.
+
+Worth knowing: the board's run-control endpoints carry a same-origin check, not
+authentication, so anything able to reach that URL can start or stop tracking.
+
+`evilkit mesh` is the merged hub/worker interface. Hosts join as explicitly
+enrolled nodes with a token, a filesystem sandbox, an allowlisted command set,
+and a kill switch. Nodes do not copy or install EvilKit on additional systems;
+deployment remains an operator-controlled provisioning step.
+
+Completed hook sessions feed deterministic behavior metrics into the learning
+ledger. Only thresholded lessons are appended, every automatic batch is tagged,
+and `evilkit learn rollback` removes the most recent batch. Use `evilkit learn
+status` and `evilkit lessons show` to inspect what changed.
+
+### Seeing the clone's own terminal (attack segment only)
+
+A deployed clone (a Pi, a laptop, any enrolled worker) runs its own terminal: a
+systemd unit that polls the hub, claims tasks and drives a local agent. `evilkit
+mesh display` watches the **attack segment** for it, proves the host's identity
+over SSH, and pops up a desktop terminal window showing that clone's live
+terminal — from the moment it is plugged in, and again when the hub deploys a
+task to it. If that clone already has a terminal window, a new registration or
+deployment raises the existing window to the front instead of silently leaving
+it behind other Parrot windows or opening a duplicate.
+
+```console
+$ evilkit mesh display                      # watch, and pop up windows, forever
+$ evilkit mesh display --once               # one detection pass
+$ evilkit mesh display --status             # unit state, targets, open windows
+$ evilkit mesh display --install-unit       # keep watching across logins
+```
+
+`evilkit mesh lead` and `evilkit mesh start` run the same watcher themselves, so
+a clone that appears while the hub is up is displayed without any extra command.
+`--no-display-clones` turns that off for one hub, and `--no-window` (or
+`EVILKIT_POPUP_WINDOWS=0`) makes the watcher report without opening anything.
+
+The window streams the clone's journal over SSH, and reconnects itself: a dropped
+stream is printed, journalled with its exit code as `terminal_stream_ended`, and
+re-established after five seconds, so a clone reboot or a brief network drop does
+not leave a dead window behind (or open a second one).
+
+The gate is the attack segment and nothing else. An address outside the
+configured `segments`, or inside any denied network — the house LAN, the estate,
+the WireGuard subnet, Tailscale, the hypervisor bridges, loopback — is refused,
+and so is a host that answers but reports a different hostname than the one
+configured. Refusals are reported; no window and no SSH session is ever opened
+for them. When no segment is configured, nothing is displayable at all.
+
+```console
+$ evilkit mesh display --once --host estate-box=10.99.50.60
+evilkit mesh: 10.99.50.60 is outside every attack segment (10.10.66.0/24)
+$ evilkit mesh display --once --no-window --host not-the-pi=10.10.66.143
+[clone-display] clone_refused: clone=not-the-pi, host=10.10.66.143, detail=answered as 'evilkit-pi-01', expected 'not-the-pi' — not this clone
+```
+
+Every detection, refusal, window and deployment is journalled with a timestamp
+to `$XDG_STATE_HOME/evilkit/clone-display.jsonl`, which is where "where and when"
+a clone was deployed is recorded. Open windows are registered in
+`clone-display-windows.json`, so a hub and a standalone watcher never open two
+windows for the same clone.
 
 Assume your project is `/srv/engagements/acme` and its `.mcp.json` contains the example `pentest`
 server. Check what the run would do before it does it:
@@ -588,6 +726,17 @@ audit_path = ""
 python = "~/tools/osint-mcp/venv/bin/python"
 script = "~/tools/osint-mcp/server.py"
 timeout_each = 240
+
+[clone_display]
+# Show a deployed clone's live terminal in a desktop window on this box.
+# Only addresses inside `segments` (and outside every denied network) are
+# ever displayed; identity is proved over SSH before anything opens.
+enabled = true
+segments = ["10.10.66.0/24"]
+deny = []
+poll_interval = 5
+terminal = ""
+log = ""
 ```
 
 | Key | Default | Effect |
@@ -602,6 +751,35 @@ timeout_each = 240
 | `[osint] python` | `~/tools/osint-mcp/venv/bin/python` | Interpreter for the passive OSINT MCP server that `evilkit osint` and `run --osint` drive. `~` is expanded at use time. |
 | `[osint] script` | `~/tools/osint-mcp/server.py` | Server entry point passed to that interpreter. |
 | `[osint] timeout_each` | `240` | Per-tool-call timeout in seconds; slower tools bump themselves up (sherlock needs 600). |
+
+`[clone_display]` configures the clone-terminal watcher described above:
+
+```toml
+[clone_display]
+enabled = true
+segments = ["10.10.66.0/24"]   # attack segments; the only displayable networks
+deny = []                       # extra networks to refuse (always refused: house, estate, WG, TS, loopback)
+poll_interval = 5.0
+terminal = ""                   # terminal emulator; empty picks one, or set EVILKIT_TERMINAL_BIN
+log = ""                        # empty: $XDG_STATE_HOME/evilkit/clone-display.jsonl
+
+[[clone_display.targets]]
+name = "evilkit-pi-01"          # must be the hostname the clone reports
+host = "10.10.66.143"
+user = "pi"
+identity = "~/.ssh/id_ed25519_evilkimi_pi"
+unit = "evilk-mesh-worker-pi.service"
+```
+
+| Key | Default | Effect |
+|---|---|---|
+| `[clone_display] enabled` | `true` | Set `false` to report detections and deployments without opening windows. |
+| `[clone_display] segments` | `["10.10.66.0/24"]` | The attack segments. Only addresses inside one of these, and outside every denied network, are ever displayed. An invalid CIDR, or a target outside every segment, is reported as a config problem and dropped. |
+| `[clone_display] deny` | `[]` | Additional networks to refuse even when a segment covers them. |
+| `[clone_display] poll_interval` | `5.0` | Seconds between detection passes. |
+| `[clone_display] terminal` | `""` | Terminal emulator to open. Empty auto-detects (konsole, gnome-terminal, xfce4-terminal, kitty, alacritty, xterm, ...). |
+| `[clone_display] log` | `""` | Where detection/deployment events are journalled. Empty uses `$XDG_STATE_HOME/evilkit/clone-display.jsonl`. |
+| `[[clone_display.targets]]` | none | One table per clone: `name` (the hostname it must report), `host`, `user`, `identity`, `unit`. Both `name` and `host` are required; a target that fails the segment guard is dropped with a warning. |
 
 A malformed file never stops a launch: every bad key falls back to its default and the run
 continues. Each problem is reported as an `evilkit: ...` warning on stderr — by `evilkit run` before
@@ -1015,8 +1193,7 @@ point `--mcp-json` at a file you wrote yourself.
 evilkit is proprietary, commercial, source-available software licensed under the
 [EvilKit Commercial License](LICENSE). It is licensed, not sold.
 
-<!-- TODO(owner): replace with the live Gumroad product URL -->
-**[Buy evilkit](https://gumroad.com/l/REPLACE-ME)** — per-seat licence, includes updates.
+Commercial licensing enquiries: **fullchecksecurity@gmail.com**.
 
 In short, from the licence text:
 
@@ -1056,10 +1233,10 @@ clean up, and the scope last written into `.mcp.json` stays there until you chan
 
 ## Status
 
-Version 1.1.0. The scope parser, the `.mcp.json` writer, the config, the theme installer, the launch
-log, `scope set/add/remove` and `watch` are the whole product: there is no plugin system and no
-Windows support. It fails closed by default, and the [Limitations](#limitations) above are the
-honest list of what it does not do.
+Version 1.2.0 research alpha. The public tree includes the unified Kimi/Qwen adapters, scope and
+deny controls, dashboard telemetry, run profiles, learning ledger, and enrolled-worker mesh. It
+fails closed by default, and the [Limitations](#limitations) above are the honest list of what it
+does not do.
 
 ## Disclaimer
 

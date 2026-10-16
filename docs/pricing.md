@@ -1,7 +1,6 @@
 # evilkit pricing and licensing
 
-<!-- TODO(owner): replace with the live Gumroad product URL -->
-**[Buy evilkit](https://gumroad.com/l/REPLACE-ME)** — per-seat licence, includes updates.
+Commercial licensing enquiries: **fullchecksecurity@gmail.com**.
 
 evilkit is paid, proprietary software. It is licensed, not sold. The binding terms are in
 [`LICENSE`](../LICENSE) at the root of the repository; this page is a summary of how the product is
@@ -12,8 +11,8 @@ bought and what the licence allows, not a substitute for it.
 - **Per seat.** One seat is one individual who installs or operates evilkit. A seat may be
   reassigned to someone else only if the original holder stops using the software entirely. Buying
   for a team means buying one seat per person who will run it.
-- **Purchased online.** Payment and delivery are handled by the product page linked above. The price,
-  the number of seats, and the term are those shown on your order or receipt.
+- **Commercial terms by enquiry.** Price, seats, delivery, and term are agreed with the copyright
+  holder and recorded in the order or receipt.
 - **Updates are included** for the licence you buy.
 - **Source-available.** You get the source, and the licence permits you to read it for inspection,
   auditing, and security review. That is not the same as an open-source licence, and it does not
@@ -63,6 +62,5 @@ Read that section first if you are buying for a team.
 
 ## Refunds and enquiries
 
-Refund terms, if any, are those stated on the product page at the time of purchase. For licensing
-enquiries or terms other than the standard ones, contact the copyright holder using the address on
-the product page or in the repository.
+Refund terms, if any, are those stated in the order at the time of purchase. For licensing
+enquiries or terms other than the standard ones, contact **fullchecksecurity@gmail.com**.

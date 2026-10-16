@@ -12,6 +12,7 @@ Not collected by ``unittest discover`` (the file is not named ``test*``).
 
 from __future__ import annotations
 
+import http.server
 import io
 import json
 import os
@@ -19,6 +20,7 @@ import pathlib
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
@@ -162,3 +164,62 @@ class EvilkitTestCase(unittest.TestCase):
             stdin=stdin,
             timeout=60,
         )
+
+
+class StubDashboard:
+    """A loopback stand-in for the lab dashboard's routes.
+
+    Records every request as ``(method, path, origin, body)`` so a test can assert
+    on the wire shape — an empty POST body and no ``Origin`` header are what the
+    real board's same-origin check requires — and answers from ``responses``
+    (path -> ``(status, payload)``). Used as a context manager; ``url`` is the base
+    URL to point a launch or a client at.
+    """
+
+    def __init__(self, responses: dict | None = None) -> None:
+        self.seen: list[tuple[str, str, str | None, bytes]] = []
+        self.responses = responses or {}
+        stub = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def _handle(self) -> None:
+                try:
+                    length = int(self.headers.get("Content-Length", 0))
+                except ValueError:
+                    length = 0
+                body = self.rfile.read(length) if length else b""
+                stub.seen.append((self.command, self.path, self.headers.get("Origin"), body))
+                status, payload = stub.responses.get(self.path, (200, {"status": "succeeded"}))
+                data = json.dumps(payload).encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            do_GET = _handle
+            do_POST = _handle
+
+            def log_message(self, *args) -> None:
+                pass
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self.server.server_address[1]}"
+
+    def posts(self) -> list[str]:
+        """The paths POSTed so far, in order."""
+        return [path for method, path, _origin, _body in self.seen if method == "POST"]
+
+    def __enter__(self) -> "StubDashboard":
+        self.thread.start()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.server.shutdown()
+        self.server.server_close()

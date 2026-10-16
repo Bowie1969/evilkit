@@ -291,7 +291,7 @@ class TestMergeAndFindings(unittest.TestCase):
 
 class TestSeedSplitting(unittest.TestCase):
     def test_whitespace_commas_and_mixed(self):
-        from evilkit.cli import _split_seeds
+        from evilkit.kernel import split_seeds as _split_seeds
 
         self.assertEqual(_split_seeds(["acme.example", "api.acme.example"]),
                          ["acme.example", "api.acme.example"])

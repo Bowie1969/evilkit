@@ -13,10 +13,13 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import BRAIN_MODEL, BRAIN_URL
+from .clone_display import CloneTarget, DisplayConfig, SegmentError, parse_networks
+from .jev import JevConfig
 from .mcpscope import SCOPE_ENV_KEY
 from .scope import SOLO_SCOPE, ScopeError, normalise_scope
 
-__all__ = ["Config", "OsintConfig", "config_dir", "config_path", "load", "save"]
+__all__ = ["Config", "OsintConfig", "DashboardConfig", "BrainConfig", "LabSshConfig", "JevConfig", "DisplayConfig", "config_dir", "config_path", "load", "save"]
 
 APP_NAME = "evilkit"
 
@@ -80,6 +83,122 @@ class OsintConfig:
 
 
 @dataclass
+class DashboardConfig:
+    """The lab dashboard's run controls, exposed to the session as MCP tools.
+
+    ``url`` is the dashboard's base URL (empty means the tools are not attached:
+    there is no default address, because a guessed host would either fail
+    obscurely or reach something that is not this board). ``attach`` decides
+    whether a launch declares the ``dashboard`` MCP server in the file the
+    engine actually reads. ``auto`` additionally drives the board from the
+    launcher: it starts tracking this launch's run before the session and stops
+    tracking when the session ends — but only if that launch is what started it,
+    so a run someone else put on the board is never taken off by this exit.
+
+    The controls are the board's own fixed scripts, and those are bookkeeping
+    (``keystone/run_control.py``): they update a prepared run's dashboard status.
+    They do not launch or tear down the range, and they do not start or stop an
+    operator session. They are, however, unauthenticated on the board's network:
+    the endpoints carry a same-origin check rather than auth, so reaching ``url``
+    is the whole authority.
+    """
+
+    url: str = ""
+    attach: bool = False
+    auto: bool = False
+    timeout: float = 5.0
+
+    def resolved_url(self) -> str:
+        """The URL to use, with an exported ``EVILKIT_DASHBOARD_URL`` winning."""
+        return os.environ.get("EVILKIT_DASHBOARD_URL", "").strip() or self.url.strip()
+
+    def enabled(self) -> bool:
+        return bool(self.resolved_url())
+
+
+@dataclass
+class LabSshConfig:
+    """Guest credentials for the malware-scripting MCP's ssh-backed tools.
+
+    ``malware_deploy`` / ``malware_test`` / ``malware_persist`` refuse to run
+    without these: they will not fabricate a deploy, and they will not run a
+    command on the MCP host and label it remote. So the launch environment is
+    where they have to arrive from — they are exported into the session, which
+    the MCP child inherits, and never written into ``.mcp.json`` or a repository.
+    An already-set ``LAB_SSH_*`` variable always wins over the config file.
+    """
+
+    user: str = ""
+    password: str = ""
+    key: str = ""
+
+    def resolved(self) -> dict[str, str]:
+        """The ``LAB_SSH_*`` environment the MCP server reads."""
+        out: dict[str, str] = {}
+        user = os.environ.get("LAB_SSH_USER") or self.user
+        password = os.environ.get("LAB_SSH_PASS") or self.password
+        key = os.environ.get("LAB_SSH_KEY") or self.key
+        if user:
+            out["LAB_SSH_USER"] = user
+        if password:
+            out["LAB_SSH_PASS"] = password
+        if key:
+            out["LAB_SSH_KEY"] = os.path.expanduser(key)
+        return out
+
+    def missing(self) -> list[str]:
+        """What still has to be supplied for the ssh-backed tools to run."""
+        resolved = self.resolved()
+        if "LAB_SSH_USER" not in resolved:
+            return ["LAB_SSH_USER", "LAB_SSH_PASS or LAB_SSH_KEY"]
+        if "LAB_SSH_PASS" not in resolved and "LAB_SSH_KEY" not in resolved:
+            return ["LAB_SSH_PASS or LAB_SSH_KEY"]
+        return []
+
+
+@dataclass
+class BrainConfig:
+    """Hosted operator/auditor settings retained for compatible brain profiles."""
+
+    operator_url: str = BRAIN_URL
+    operator_model: str = BRAIN_MODEL
+    operator_key: str = ""
+    auditor_url: str = BRAIN_URL
+    auditor_model: str = "venice-uncensored-1-1"
+    auditor_key: str = ""
+    brain_max_turns: int = 50
+    brain_executor: str = "simulation"
+    operator_subscription_first: bool = True
+
+    def resolved_operator_url(self) -> str:
+        return os.environ.get("EVILKIT_OPERATOR_URL", self.operator_url)
+
+    def resolved_operator_model(self) -> str:
+        return os.environ.get("EVILKIT_OPERATOR_MODEL", self.operator_model)
+
+    def resolved_operator_key(self) -> str:
+        return os.environ.get("EVILKIT_OPERATOR_KEY", self.operator_key)
+
+    def resolved_auditor_url(self) -> str:
+        return os.environ.get("EVILKIT_AUDITOR_URL", self.auditor_url)
+
+    def resolved_auditor_model(self) -> str:
+        return os.environ.get("EVILKIT_AUDITOR_MODEL", self.auditor_model)
+
+    def resolved_auditor_key(self) -> str:
+        return os.environ.get("EVILKIT_AUDITOR_KEY", self.auditor_key)
+
+    def resolved_brain_max_turns(self) -> int:
+        try:
+            return int(os.environ.get("EVILKIT_BRAIN_MAX_TURNS", self.brain_max_turns))
+        except ValueError:
+            return self.brain_max_turns
+
+    def resolved_brain_executor(self) -> str:
+        return os.environ.get("EVILKIT_BRAIN_EXECUTOR", self.brain_executor)
+
+
+@dataclass
 class Config:
     """Resolved settings, with every field defaulted to something safe."""
 
@@ -91,6 +210,11 @@ class Config:
     audit_path: str = ""
     extra_env: dict[str, str] = field(default_factory=dict)
     osint: OsintConfig = field(default_factory=OsintConfig)
+    dashboard: DashboardConfig = field(default_factory=DashboardConfig)
+    brain: BrainConfig = field(default_factory=BrainConfig)
+    jev: JevConfig = field(default_factory=JevConfig)
+    clone_display: DisplayConfig = field(default_factory=DisplayConfig)
+    lab_ssh: LabSshConfig = field(default_factory=LabSshConfig)
 
     #: Populated by :func:`load` so callers can report where settings came from.
     source: Path | None = None
@@ -139,6 +263,237 @@ def _coerce_osint(raw: dict, problems: list[str]) -> dict:
     return values
 
 
+def _coerce_dashboard(raw: dict, problems: list[str]) -> DashboardConfig:
+    """Validate the ``[dashboard]`` table into a DashboardConfig.
+
+    The URL is the whole authority for the run controls (the dashboard's own
+    endpoints are unauthenticated on its network), so a value that is not an
+    http(s) URL is reported and dropped rather than passed on to be fetched.
+    """
+    known = {"url", "attach", "auto", "timeout"}
+    values: dict = {}
+    for key in raw:
+        if key not in known:
+            problems.append(f"unknown [dashboard] key {key!r} ignored")
+    if "url" in raw:
+        if isinstance(raw["url"], str):
+            values["url"] = raw["url"].strip().rstrip("/")
+        else:
+            problems.append("[dashboard] url must be a string")
+    for key in ("attach", "auto"):
+        if key in raw:
+            if isinstance(raw[key], bool):
+                values[key] = raw[key]
+            else:
+                problems.append(f"[dashboard] {key} must be true or false")
+    if "timeout" in raw:
+        value = raw["timeout"]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+            problems.append("[dashboard] timeout must be a positive number")
+        else:
+            values["timeout"] = float(value)
+    url = values.get("url", "")
+    if url and not url.startswith(("http://", "https://")):
+        problems.append(f"[dashboard] url must be an http:// or https:// URL (got {url!r}); ignored")
+        values.pop("url", None)
+    if values.get("attach") and not values.get("url"):
+        problems.append(
+            "[dashboard] attach is true but url is empty; set url (or export "
+            "EVILKIT_DASHBOARD_URL) or nothing will be attached"
+        )
+    if values.get("auto") and not values.get("url"):
+        problems.append(
+            "[dashboard] auto is true but url is empty; set url (or export "
+            "EVILKIT_DASHBOARD_URL) or the range will not be driven"
+        )
+    return DashboardConfig(**values)
+
+
+def _coerce_brain(raw: dict, problems: list[str]) -> BrainConfig:
+    known = {
+        "operator_url", "operator_model", "operator_key", "auditor_url",
+        "auditor_model", "auditor_key", "brain_max_turns", "brain_executor",
+        "operator_subscription_first",
+    }
+    values: dict = {}
+    for key in raw:
+        if key not in known:
+            problems.append(f"unknown [brain] key {key!r} ignored")
+    for key in ("operator_url", "operator_model", "operator_key", "auditor_url", "auditor_model", "auditor_key"):
+        if key in raw:
+            if isinstance(raw[key], str):
+                values[key] = raw[key]
+            else:
+                problems.append(f"[brain] {key} must be a string")
+    if "brain_max_turns" in raw:
+        value = raw["brain_max_turns"]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            problems.append("[brain] brain_max_turns must be a positive integer")
+        else:
+            values["brain_max_turns"] = value
+    if "brain_executor" in raw:
+        value = raw["brain_executor"]
+        if value in {"simulation", "shell"}:
+            values["brain_executor"] = value
+        else:
+            problems.append("[brain] brain_executor must be 'simulation' or 'shell'")
+    if "operator_subscription_first" in raw:
+        value = raw["operator_subscription_first"]
+        if isinstance(value, bool):
+            values["operator_subscription_first"] = value
+        else:
+            problems.append("[brain] operator_subscription_first must be true or false")
+    return BrainConfig(**values)
+
+
+def _coerce_jev(raw: dict, problems: list[str]) -> JevConfig:
+    known = {"enabled", "endpoint", "model", "api_key", "timeout", "loop_threshold"}
+    values: dict = {}
+    for key in raw:
+        if key not in known:
+            problems.append(f"unknown [jev] key {key!r} ignored")
+    if "enabled" in raw:
+        if isinstance(raw["enabled"], bool):
+            values["enabled"] = raw["enabled"]
+        else:
+            problems.append("[jev] enabled must be true or false")
+    for key in ("endpoint", "model", "api_key"):
+        if key in raw:
+            if isinstance(raw[key], str):
+                values[key] = raw[key]
+            else:
+                problems.append(f"[jev] {key} must be a string")
+    for key in ("timeout", "loop_threshold"):
+        if key in raw:
+            value = raw[key]
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                problems.append(f"[jev] {key} must be a number")
+            elif key == "timeout" and value <= 0:
+                problems.append("[jev] timeout must be greater than zero")
+            elif key == "loop_threshold" and not 0 <= value <= 1:
+                problems.append("[jev] loop_threshold must be between zero and one")
+            else:
+                values[key] = float(value)
+    return JevConfig(**values)
+
+
+def _coerce_clone_display(raw: dict, problems: list[str]) -> DisplayConfig:
+    """Validate the ``[clone_display]`` table.
+
+    The attack segment is the whole security boundary for this feature, so a
+    bad value is reported and dropped rather than guessed at.
+    """
+    known = {"enabled", "segments", "deny", "targets", "poll_interval", "terminal", "log",
+             "name", "host", "user", "identity", "unit"}
+    values: dict = {}
+    for key in raw:
+        if key not in known:
+            problems.append(f"unknown [clone_display] key {key!r} ignored")
+
+    if "enabled" in raw:
+        if isinstance(raw["enabled"], bool):
+            values["enabled"] = raw["enabled"]
+        else:
+            problems.append("[clone_display] enabled must be true or false")
+
+    for key in ("segments", "deny"):
+        if key in raw:
+            entries = raw[key]
+            if not isinstance(entries, list) or not all(isinstance(v, str) for v in entries):
+                problems.append(f"[clone_display] {key} must be an array of CIDR strings")
+                continue
+            try:
+                parse_networks(entries)
+            except SegmentError as exc:
+                problems.append(f"[clone_display] {key} rejected ({exc})")
+                continue
+            values[key] = tuple(v.strip() for v in entries if v.strip())
+
+    for key in ("terminal", "log"):
+        if key in raw:
+            if isinstance(raw[key], str):
+                values[key] = raw[key].strip()
+            else:
+                problems.append(f"[clone_display] {key} must be a string")
+
+    if "poll_interval" in raw:
+        poll = raw["poll_interval"]
+        if isinstance(poll, bool) or not isinstance(poll, (int, float)) or poll <= 0:
+            problems.append("[clone_display] poll_interval must be a positive number")
+        else:
+            values["poll_interval"] = float(poll)
+    if "targets" in raw:
+        entries = raw["targets"]
+        if not isinstance(entries, list):
+            problems.append("[clone_display] targets must be an array of tables ([[clone_display.targets]])")
+        else:
+            targets: list[CloneTarget] = []
+            for index, entry in enumerate(entries, start=1):
+                if not isinstance(entry, dict):
+                    problems.append(f"[clone_display] targets[{index}] must be a table")
+                    continue
+                name = str(entry.get("name", "")).strip()
+                host = str(entry.get("host", "")).strip()
+                if not name or not host:
+                    problems.append(
+                        f"[clone_display] targets[{index}] needs both name and host"
+                    )
+                    continue
+                targets.append(
+                    CloneTarget(
+                        name=name,
+                        host=host,
+                        user=str(entry.get("user", "pi")).strip() or "pi",
+                        identity=str(entry.get("identity", "~/.ssh/id_ed25519_evilkimi_pi")).strip(),
+                        unit=str(entry.get("unit", "evilk-mesh-worker-pi.service")).strip(),
+                    )
+                )
+            values["targets"] = tuple(targets)
+
+    # Defaults (or an explicit entry) must survive the guard: a target that cannot
+    # be shown on any attack segment is dropped here, not at display time.
+    segments = values.get("segments", DisplayConfig().segments)
+    deny = values.get("deny", DisplayConfig().deny)
+    keepeable: list[CloneTarget] = []
+    for target in values.get("targets", DisplayConfig().targets):
+        from .clone_display import attack_segment_of
+
+        try:
+            attack_segment_of(target.host, segments, deny)
+        except SegmentError as exc:
+            problems.append(f"[clone_display] target {target.name!r} rejected ({exc})")
+            continue
+        keepeable.append(target)
+    if "targets" in values:
+        values["targets"] = tuple(keepeable)
+
+    return DisplayConfig(**values)
+
+
+def _coerce_lab_ssh(raw: dict, problems: list[str]) -> LabSshConfig:
+    """Validate the ``[lab_ssh]`` table into a LabSshConfig.
+
+    Only the two shapes a guest login can take are accepted: a password, or a
+    private key path. Both together are allowed (a key with a passphrase-less
+    login plus a password fallback), neither is reported as a problem because a
+    passwordless key is legitimate.
+    """
+    values: dict = {}
+    known = {"user", "password", "key"}
+    for key in raw:
+        if key not in known:
+            problems.append(f"unknown [lab_ssh] key {key!r} ignored")
+    for key in ("user", "password", "key"):
+        if key in raw:
+            if isinstance(raw[key], str):
+                values[key] = raw[key].strip()
+            else:
+                problems.append(f"[lab_ssh] {key} must be a string")
+    if values.get("key"):
+        values["key"] = os.path.expanduser(values["key"])
+    return LabSshConfig(**values)
+
+
 def _coerce(raw: dict) -> tuple[dict, list[str]]:
     known = {
         "kimi_bin",
@@ -149,6 +504,11 @@ def _coerce(raw: dict) -> tuple[dict, list[str]]:
         "audit_path",
         "extra_env",
         "osint",
+        "dashboard",
+        "brain",
+        "jev",
+        "clone_display",
+        "lab_ssh",
     }
     values: dict = {}
     problems: list[str] = []
@@ -217,6 +577,36 @@ def _coerce(raw: dict) -> tuple[dict, list[str]]:
         else:
             problems.append("[osint] must be a table ([osint] python = ...)")
 
+    if "dashboard" in raw:
+        if isinstance(raw["dashboard"], dict):
+            values["dashboard"] = _coerce_dashboard(raw["dashboard"], problems)
+        else:
+            problems.append("[dashboard] must be a table")
+
+    if "brain" in raw:
+        if isinstance(raw["brain"], dict):
+            values["brain"] = _coerce_brain(raw["brain"], problems)
+        else:
+            problems.append("[brain] must be a table")
+
+    if "jev" in raw:
+        if isinstance(raw["jev"], dict):
+            values["jev"] = _coerce_jev(raw["jev"], problems)
+        else:
+            problems.append("[jev] must be a table")
+
+    if "clone_display" in raw:
+        if isinstance(raw["clone_display"], dict):
+            values["clone_display"] = _coerce_clone_display(raw["clone_display"], problems)
+        else:
+            problems.append("[clone_display] must be a table")
+
+    if "lab_ssh" in raw:
+        if isinstance(raw["lab_ssh"], dict):
+            values["lab_ssh"] = _coerce_lab_ssh(raw["lab_ssh"], problems)
+        else:
+            problems.append("[lab_ssh] must be a table")
+
     return values, problems
 
 
@@ -260,6 +650,10 @@ def _format_key(key: str) -> str:
     return _format_value(key)
 
 
+def _format_array(values) -> str:
+    return "[" + ", ".join(_format_value(str(value)) for value in values) + "]"
+
+
 def dumps(config: Config) -> str:
     lines = [
         "# evilkit configuration",
@@ -296,7 +690,65 @@ def dumps(config: Config) -> str:
         f"python = {_format_value(config.osint.python_bin)}",
         f"script = {_format_value(config.osint.script)}",
         f"timeout_each = {config.osint.timeout_each:g}",
+        "",
+        "[dashboard]",
+        "# Lab dashboard whose run controls the session may call as MCP tools",
+        "# (start_run, stop_run, end_run, run_status). An empty url attaches nothing:",
+        "# there is no default address, so set the board you actually mean.",
+        f"url = {_format_value(config.dashboard.url)}",
+        f"attach = {_format_value(config.dashboard.attach)}",
+        "# auto also drives the range from the launcher: up before the session,",
+        "# down again when it ends - but only if this launch brought it up.",
+        f"auto = {_format_value(config.dashboard.auto)}",
+        f"timeout = {config.dashboard.timeout:g}",
+        "",
+        "[brain]",
+        f"operator_url = {_format_value(config.brain.operator_url)}",
+        f"operator_model = {_format_value(config.brain.operator_model)}",
+        f"auditor_url = {_format_value(config.brain.auditor_url)}",
+        f"auditor_model = {_format_value(config.brain.auditor_model)}",
+        f"brain_max_turns = {config.brain.brain_max_turns}",
+        f"brain_executor = {_format_value(config.brain.brain_executor)}",
+        f"operator_subscription_first = {_format_value(config.brain.operator_subscription_first)}",
+        "",
+        "[jev]",
+        f"enabled = {_format_value(config.jev.enabled)}",
+        f"endpoint = {_format_value(config.jev.endpoint)}",
+        f"model = {_format_value(config.jev.model)}",
+        f"timeout = {config.jev.timeout:g}",
+        f"loop_threshold = {config.jev.loop_threshold:g}",
+        "",
+        "[clone_display]",
+        "# Show a deployed clone's live terminal in a desktop window on this box.",
+        "# Only addresses inside `segments` (and outside every denied network) are",
+        "# ever displayed; identity is proved over SSH before anything opens.",
+        f"enabled = {_format_value(config.clone_display.enabled)}",
+        f"segments = {_format_array(config.clone_display.segments)}",
+        f"deny = {_format_array(config.clone_display.deny)}",
+        f"poll_interval = {config.clone_display.poll_interval:g}",
+        f"terminal = {_format_value(config.clone_display.terminal)}",
+        f"log = {_format_value(config.clone_display.log)}",
+        "",
+        "[lab_ssh]",
+        "# Guest login for the malware-scripting MCP's deploy/test/persist tools.",
+        "# These are exported into the session environment (the MCP child inherits",
+        "# them) and are deliberately NOT written back by `evilkit config` — add",
+        "# password and/or key to this table by hand. An already-set LAB_SSH_*",
+        "# variable wins over anything here.",
+        f"user = {_format_value(config.lab_ssh.user)}",
+        '# password = "..."',
+        '# key = "~/.ssh/id_ed25519_lab"',
     ]
+    for target in config.clone_display.targets:
+        lines += [
+            "",
+            "[[clone_display.targets]]",
+            f"name = {_format_value(target.name)}",
+            f"host = {_format_value(target.host)}",
+            f"user = {_format_value(target.user)}",
+            f"identity = {_format_value(target.identity)}",
+            f"unit = {_format_value(target.unit)}",
+        ]
     return "\n".join(lines) + "\n"
 
 

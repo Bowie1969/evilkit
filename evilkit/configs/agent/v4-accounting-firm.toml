@@ -54,7 +54,8 @@ methodology = """
 tool_suggestions = """
 - Mail and DNS posture: `dig`/`host` for MX, TXT (SPF), DKIM selectors and `_dmarc`.
 - Surface mapping: `curl -sI` and `curl -s` for /, /staff-login, /portal, /login, /vpn,
-  /remote, /autodiscover, /robots.txt; `nmap -sV -Pn` against authorised hosts only.
+  /remote, /autodiscover, /robots.txt; `rustscan -a <host>` for fast TCP port discovery
+  against authorised hosts only.
 - Identity: a single-account, low-rate auth test after checking lockout; note legacy protocol
   support (IMAP/POP/basic auth) as a finding in itself.
 - Directory and file estate: `ldapsearch` for anonymous/exposed directory reads,

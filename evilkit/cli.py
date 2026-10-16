@@ -3,36 +3,26 @@
 from __future__ import annotations
 
 import argparse
-import os
-import shutil
 import sys
 from pathlib import Path
 
-from . import (
-    __version__,
-    agent as agent_mod,
-    audit as audit_mod,
-    config as config_mod,
-    mcpscope,
-    scope as scope_mod,
-    theme as theme_mod,
-    watch as watch_mod,
-)
+from . import __version__
+from . import commands
+from . import config as config_mod
 
-__all__ = ["main", "build_parser"]
+__all__ = ["main", "build_parser", "EXIT_OK", "EXIT_ERROR", "EXIT_USAGE"]
 
 PROG = "evilkit"
-IDENTITY = "evilkit"
 
 EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_USAGE = 2
 
-#: Findings rows shown in the interactive selection; the JSON file always
-#: holds everything, and --osint-accept matches against the full set.
-OSINT_DISPLAY_LIMIT = 50
-
-COMMANDS = ("run", "osint", "scope", "log", "watch", "doctor", "theme", "config", "agent", "version")
+COMMANDS = (
+    "run", "kimi", "qwen", "mesh", "osint", "patch-diff-poc", "scope",
+    "log", "watch", "doctor", "theme", "config", "agent", "lessons",
+    "learn", "hooks", "dashboard", "calls", "version",
+)
 
 _EPILOG = """\
 examples:
@@ -52,14 +42,6 @@ examples:
 
 Every argument after `--` is passed straight through to the Kimi Code CLI.
 """
-
-
-def _out(message: str = "") -> None:
-    print(message)
-
-
-def _warn(message: str) -> None:
-    print(f"{PROG}: {message}", file=sys.stderr)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -156,6 +138,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="do not append this launch to the local log",
     )
+    run.add_argument(
+        "--window",
+        action="store_true",
+        help="open the session in a new desktop terminal window on this box",
+    )
+
     osint_cmd = sub.add_parser(
         "osint",
         help="run the passive OSINT stage; never launches anything",
@@ -164,31 +152,38 @@ def build_parser() -> argparse.ArgumentParser:
                     "candidates are only ever scope when you pass them to "
                     "`run --osint-accept` or pick them in the interactive stage.",
     )
+    osint_cmd.add_argument("seeds", nargs="+", metavar="SEED",
+                           help="domains, hostnames, emails, usernames, IPs or phone numbers")
+    osint_cmd.add_argument("--only", metavar="TOOLS", help="comma-separated subset of tools to run")
+    osint_cmd.add_argument("--skip", metavar="TOOLS", help="comma-separated tools to drop")
     osint_cmd.add_argument(
-        "seeds",
-        nargs="+",
-        metavar="SEED",
-        help="domains, hostnames, emails, usernames, IPs or phone numbers",
+        "--json", dest="json_path", type=Path, metavar="PATH",
+        help="write findings to PATH (default: osint-findings.json here)"
     )
     osint_cmd.add_argument(
-        "--only", metavar="TOOLS", help="comma-separated subset of tools to run"
-    )
-    osint_cmd.add_argument(
-        "--skip", metavar="TOOLS", help="comma-separated tools to drop"
-    )
-    osint_cmd.add_argument(
-        "--json",
-        dest="json_path",
-        type=Path,
-        metavar="PATH",
-        help="write findings to PATH (default: osint-findings.json here)",
-    )
-    osint_cmd.add_argument(
-        "--attach",
-        action="store_true",
+        "--attach", action="store_true",
         help="also write the osint MCP server into the engagement .mcp.json, "
-             "so the next kimi session here has the recon tools (never launches)",
+             "so the next kimi session here has the recon tools (never launches)"
     )
+
+    pdp = sub.add_parser(
+        "patch-diff-poc",
+        help="turn a security-fix commit on GitHub into a scope-gated PoC script",
+        description="Fetch a GitHub commit, derive a PocRecipe from its diff, "
+                    "and emit a stdlib-only PoC request script that refuses to "
+                    "run against a host not listed in the given scope file.",
+    )
+    pdp.add_argument("commit", metavar="COMMIT",
+                     help="https://github.com/<owner>/<repo>/commit/<sha> or <owner>/<repo>@<sha>")
+    pdp.add_argument("--out-dir", type=Path, default=None, metavar="DIR",
+                     help="write recipe + script here (default: current directory)")
+    pdp.add_argument("--flag-path", default="/opt/app/flag.txt", metavar="PATH",
+                     help="flag path baked into eval-sink / path-traversal payloads")
+    pdp.add_argument("--timeout", type=float, default=20.0, metavar="SECONDS",
+                     help="GitHub API timeout (default: 20)")
+    pdp.add_argument("--print-only", action="store_true",
+                     help="print the recipe JSON to stdout and do not write files")
+
     scope_cmd = sub.add_parser("scope", help="inspect or change the recorded scope")
     scope_sub = scope_cmd.add_subparsers(dest="scope_command", metavar="ACTION")
     scope_cmd.set_defaults(
@@ -205,72 +200,36 @@ def build_parser() -> argparse.ArgumentParser:
         ("remove", "narrow the recorded scope by the targets given"),
     ):
         editor = scope_sub.add_parser(action, help=blurb)
-        editor.add_argument(
-            "targets",
-            metavar="TARGETS",
-            help="comma-separated hosts, IPs or CIDRs; 'solo' for the locked-down default",
-        )
+        editor.add_argument("targets", metavar="TARGETS",
+                            help="comma-separated hosts, IPs or CIDRs; 'solo' for the locked-down default")
         editor.add_argument("--mcp-json", metavar="PATH", type=Path)
-        editor.add_argument(
-            "--allow-any",
-            action="store_true",
-            help="permit a /0 scope, which authorises every address",
-        )
-        editor.add_argument(
-            "--dry-run", action="store_true", help="report the change without writing it"
-        )
+        editor.add_argument("--allow-any", action="store_true",
+                            help="permit a /0 scope, which authorises every address")
+        editor.add_argument("--dry-run", action="store_true",
+                            help="report the change without writing it")
 
     log_cmd = sub.add_parser("log", help="list the launches recorded locally")
-    log_cmd.add_argument(
-        "-n",
-        "--limit",
-        metavar="N",
-        type=int,
-        default=20,
-        help="show the newest N entries; 0 shows every entry (default: 20)",
-    )
+    log_cmd.add_argument("-n", "--limit", metavar="N", type=int, default=20,
+                         help="show the newest N entries; 0 shows every entry (default: 20)")
     log_cmd.add_argument("--path", metavar="PATH", type=Path, help="read a different log file")
     log_cmd.add_argument("--json", action="store_true", help="print the raw log lines")
 
-    watch_cmd = sub.add_parser(
-        "watch", help="watch the recorded scope and alarm if it changes"
-    )
-    watch_cmd.add_argument(
-        "--mcp-json",
-        metavar="PATH",
-        type=Path,
-        help="path to .mcp.json (default: nearest one at or above the working directory)",
-    )
-    watch_cmd.add_argument(
-        "--interval",
-        metavar="SECONDS",
-        type=float,
-        default=1.0,
-        help="how often to sample the recorded scope (default: 1.0)",
-    )
-    watch_cmd.add_argument(
-        "--once",
-        action="store_true",
-        help="print a single frame and exit, for scripts and pipes",
-    )
-    watch_cmd.add_argument(
-        "--no-color", action="store_true", help="never use ANSI colour, even on a terminal"
-    )
-    watch_cmd.add_argument(
-        "-n",
-        "--limit",
-        metavar="N",
-        type=int,
-        default=5,
-        help="how many recent launches to show; 0 shows none (default: 5)",
-    )
+    watch_cmd = sub.add_parser("watch", help="watch the recorded scope and alarm if it changes")
+    watch_cmd.add_argument("--mcp-json", metavar="PATH", type=Path,
+                           help="path to .mcp.json (default: nearest one at or above the working directory)")
+    watch_cmd.add_argument("--interval", metavar="SECONDS", type=float, default=1.0,
+                           help="how often to sample the recorded scope (default: 1.0)")
+    watch_cmd.add_argument("--once", action="store_true",
+                           help="print a single frame and exit, for scripts and pipes")
+    watch_cmd.add_argument("--no-color", action="store_true",
+                           help="never use ANSI colour, even on a terminal")
+    watch_cmd.add_argument("-n", "--limit", metavar="N", type=int, default=5,
+                           help="how many recent launches to show; 0 shows none (default: 5)")
 
     sub.add_parser("doctor", help="check the local installation")
 
     theme_cmd = sub.add_parser("theme", help="manage the bundled colour theme")
-    theme_cmd.add_argument(
-        "action", nargs="?", choices=("install", "status"), default="status"
-    )
+    theme_cmd.add_argument("action", nargs="?", choices=("install", "status"), default="status")
     theme_cmd.add_argument("--force", action="store_true", help="overwrite an existing theme")
 
     config_cmd = sub.add_parser("config", help="show configuration")
@@ -284,1035 +243,92 @@ def build_parser() -> argparse.ArgumentParser:
         help="run a versioned Kimi K3 augmentation config against a target",
         description="Load a versioned agent config and run it through the Kimi Code CLI.",
     )
-    agent_cmd.add_argument(
-        "--config",
-        metavar="PATH",
-        type=Path,
-        help="path to the agent config TOML file",
+    agent_cmd.add_argument("--config", metavar="PATH", type=Path, help="path to the agent config TOML file")
+    agent_cmd.add_argument("--target", metavar="HOST:PORT", help="authorized target for the agent to assess")
+    agent_cmd.add_argument("--interactive", action="store_true",
+                           help="after the first response, allow follow-up prompts")
+    agent_cmd.add_argument("--list", action="store_true", help="list built-in agent configs and exit")
+    agent_cmd.add_argument("--mcp-json", metavar="PATH", type=Path,
+                           help="path to the .mcp.json whose recorded scope gates this run")
+    agent_cmd.add_argument("--no-audit", action="store_true", help="do not append this launch to the local log")
+
+    sub.add_parser("kimi", add_help=False, help="launch the scoped Kimi CLI adapter")
+    sub.add_parser("qwen", add_help=False, help="launch the scoped Qwen CLI adapter")
+    sub.add_parser("mesh", add_help=False, help="coordinate explicitly enrolled lab workers and nodes")
+
+    lessons_cmd = sub.add_parser("lessons", help="inspect or add durable operator lessons")
+    lessons_sub = lessons_cmd.add_subparsers(dest="lessons_command", metavar="ACTION")
+    lessons_sub.add_parser("show", help="print the lessons injected into Kimi and Qwen")
+    lessons_sub.add_parser("path", help="print the lessons file path")
+    lessons_add = lessons_sub.add_parser("add", help="append a manually reviewed lesson")
+    lessons_add.add_argument("title")
+    lessons_add.add_argument("body")
+    lessons_add.add_argument("--source")
+
+    learn_cmd = sub.add_parser("learn", help="inspect or feed the reversible self-training loop")
+    learn_sub = learn_cmd.add_subparsers(dest="learn_command", metavar="ACTION")
+    learn_sub.add_parser("status", help="show session metrics by lessons generation")
+    learn_sub.add_parser("rollback", help="remove the most recent automatic lesson batch")
+    learn_ingest = learn_sub.add_parser("ingest", help="learn from a hook session JSONL file")
+    learn_ingest.add_argument("path", type=Path)
+    learn_ingest.add_argument("--run-id")
+    learn_ingest.add_argument("--dry-run", action="store_true")
+
+    hooks_cmd = sub.add_parser("hooks", help="install or inspect the shared Kimi/Qwen event bridge")
+    hooks_cmd.add_argument("hooks_action", nargs="?", choices=("install", "status"), default="status")
+    hooks_cmd.add_argument("--engine", choices=("all", "kimi", "qwen"), default="all")
+
+    dashboard_cmd = sub.add_parser("dashboard", help="inspect a Keystone run fed by EvilKit")
+    dashboard_cmd.add_argument("dashboard_action", nargs="?", choices=("status", "tail"), default="status")
+    dashboard_cmd.add_argument("--run-dir", type=Path, required=True)
+    dashboard_cmd.add_argument("-n", "--limit", type=int, default=20)
+
+    calls_cmd = sub.add_parser(
+        "calls",
+        help="classify the tool calls in a session log",
+        description="Read a session log (EvilKit's own, the Kimi wire, or a Qwen "
+                    "transcript) and report what each tool call actually did: a real "
+                    "result, a refusal, a timeout, an auth failure, or nothing usable.",
     )
-    agent_cmd.add_argument(
-        "--target",
-        metavar="HOST:PORT",
-        help="authorized target for the agent to assess",
+    calls_sub = calls_cmd.add_subparsers(dest="calls_command", metavar="ACTION")
+    calls_cmd.set_defaults(calls_command=None, path=None, json=False, limit=15, session_dir=None)
+    calls_classify = calls_sub.add_parser("classify", help="classify every call in a log")
+    calls_classify.add_argument("path", metavar="LOG", help="session log to read")
+    calls_classify.add_argument("--json", action="store_true", help="print the full report as JSON")
+    calls_classify.add_argument("-n", "--limit", type=int, default=15,
+                                help="how many problem calls and repeats to list (default: 15)")
+
+    calls_verify = calls_sub.add_parser(
+        "verify-run",
+        help="check that a run's session log, dashboard events and journal agree",
+        description="Compare what a run recorded about itself with what the dashboard "
+                    "and the scorer's journal recorded, and report every disagreement.",
     )
-    agent_cmd.add_argument(
-        "--interactive",
-        action="store_true",
-        help="after the first response, allow follow-up prompts",
-    )
-    agent_cmd.add_argument(
-        "--list",
-        action="store_true",
-        help="list built-in agent configs and exit",
-    )
-    agent_cmd.add_argument(
-        "--mcp-json",
-        metavar="PATH",
-        type=Path,
-        help="path to the .mcp.json whose recorded scope gates this run",
-    )
-    agent_cmd.add_argument(
-        "--no-audit",
-        action="store_true",
-        help="do not append this launch to the local log",
-    )
+    calls_verify.add_argument("path", metavar="RUN_DIR", help="prepared run directory")
+    calls_verify.add_argument("--json", action="store_true", help="print the full report as JSON")
+    calls_verify.add_argument("--session-dir", type=Path, metavar="PATH",
+                              help="where the harness session logs live "
+                                   "(default: $XDG_STATE_HOME/evilkimi/sessions)")
 
     sub.add_parser("version", help="print the version")
 
     return parser
 
 
-def _resolve_mcp_path(explicit: Path | None) -> Path | None:
-    if explicit is not None:
-        resolved = explicit.expanduser()
-        if not resolved.is_file():
-            raise mcpscope.McpNotFound(f"{resolved} does not exist")
-        return resolved.resolve()
-    try:
-        return mcpscope.find()
-    except mcpscope.McpNotFound:
-        return None
-
-
-def _prompt_scope(config: config_mod.Config) -> str:
-    """Ask for a scope. Returns the raw answer, which may be empty."""
-    default = config.default_scope
-    hint = f" [enter = {default}]"
-    try:
-        answer = input(f"scope{hint}> ")
-    except (EOFError, KeyboardInterrupt):
-        _out()
-        return ""
-    return answer
-
-
-def _collect_scope(args, config: config_mod.Config) -> str:
-    """Work out the scope to use, from the flag, the prompt, or the default."""
-    if args.scope is not None:
-        return args.scope.strip()
-
-    env_value = os.environ.get(mcpscope.SCOPE_ENV_KEY, "").strip()
-    if env_value:
-        return env_value
-
-    if args.yes or not sys.stdin.isatty():
-        return config.default_scope
-
-    answer = _prompt_scope(config)
-    return answer.strip() or config.default_scope
-
-
-def _not_recorded(
-    normalised: str, message: str, allow_unscoped: bool, dry_run: bool
-) -> tuple[str, int, bool]:
-    """Decide what to do when the scope could not be recorded.
-
-    Failing closed is the default: the ``.mcp.json`` env block wins over the
-    parent environment, so launching here would enforce whatever scope the file
-    already held rather than the one the operator asked for.
-    """
-    if allow_unscoped:
-        _warn(f"{message} — launching with the scope NOT recorded")
-        _warn(
-            "the enforced scope may differ from the one requested; "
-            "check .mcp.json before trusting it"
-        )
-        if dry_run:
-            _out(f"{PROG}: would not record {normalised} (unscoped launch allowed)")
-        return normalised, EXIT_OK, False
-    _warn(message)
-    _warn("nothing was launched: the scope could not be recorded")
-    _warn("pass --allow-unscoped to launch anyway, knowing the scope may differ")
-    return "", EXIT_ERROR, False
-
-
-def _normalise_deny(raw: str | None, *, allow_any: bool) -> str | None:
-    """Normalise a ``--deny`` value, or None when the flag was not given.
-
-    None is not the same as empty: it means "say nothing about the deny list",
-    which leaves whatever is recorded in place. An empty value is the explicit
-    "deny nothing" and is handled here rather than by ``parse_scope``, whose
-    empty-string answer is the solo loopback sentinel — an empty *allow* scope
-    means "lock down to loopback", but there is no equivalent reading for a deny
-    list, and inheriting that one would deny the operator's own loopback.
-    """
-    if raw is None:
-        return None
-    if not raw.strip():
-        return ""
-    return scope_mod.normalise_scope(raw, allow_any=allow_any)
-
-
-def _deny_note(deny: str | None) -> str:
-    """A suffix naming the deny list that goes with a reported scope, if any."""
-    if deny is None:
-        return ""
-    return f" [deny: {deny or 'none'}]"
-
-
-def _apply_scope(
-    scope_text: str,
-    mcp_path: Path | None,
-    config: config_mod.Config,
-    *,
-    write: bool,
-    allow_unscoped: bool,
-    allow_any: bool,
-    dry_run: bool = False,
-    deny_text: str | None = None,
-) -> tuple[str, int, bool]:
-    """Validate the scope and record it. Returns (scope, exit_code, enforced).
-
-    ``write`` says whether a write is intended at all; ``dry_run`` says not to
-    touch the disk. A dry run therefore inspects the same target and reports the
-    same failures as a real run. ``enforced`` is True only when the returned
-    scope is genuinely in force, which means it was recorded in the file and
-    nothing else. A scope that was deliberately not written cannot be enforced:
-    the file still holds whatever it held before.
-
-    ``deny_text`` is the raw ``--deny`` value, or None when it was not passed.
-    Both lists are validated before either is written, so a rejectable deny
-    token leaves the file exactly as it was.
-    """
-    try:
-        normalised = scope_mod.normalise_scope(scope_text, allow_any=allow_any)
-    except scope_mod.ScopeError as exc:
-        _warn(f"{exc}")
-        _warn("expected a comma-separated list of hosts, IPs or CIDRs, or 'solo'")
-        return "", EXIT_USAGE, False
-
-    try:
-        deny = _normalise_deny(deny_text, allow_any=allow_any)
-    except scope_mod.ScopeError as exc:
-        _warn(f"{exc}")
-        _warn("expected a comma-separated list of hosts, IPs or CIDRs for the deny list")
-        return "", EXIT_USAGE, False
-
-    if not write:
-        reason = "--dry-run" if dry_run else "--no-write"
-        _out(f"{PROG}: scope -> {normalised}{_deny_note(deny)} (not written; {reason})")
-        return normalised, EXIT_OK, False
-
-    if mcp_path is None:
-        return _not_recorded(
-            normalised,
-            "no .mcp.json here or in any parent directory; nothing to scope",
-            allow_unscoped,
-            dry_run,
-        )
-
-    try:
-        changed = mcpscope.write_scope(
-            mcp_path,
-            normalised,
-            keep_backups=config.backup_keep,
-            dry_run=dry_run,
-            deny=deny,
-        )
-    except mcpscope.NoPentestServer:
-        return _not_recorded(
-            normalised,
-            f"{mcp_path} declares no 'pentest' server; nothing to scope",
-            allow_unscoped,
-            dry_run,
-        )
-    except mcpscope.McpError as exc:
-        return _not_recorded(normalised, str(exc), allow_unscoped, dry_run)
-
-    if dry_run:
-        if changed:
-            _out(f"{PROG}: would record {normalised} in {mcp_path}{_deny_note(deny)}")
-        else:
-            _out(f"{PROG}: would leave {mcp_path} at {normalised}{_deny_note(deny)}")
-    elif changed:
-        _out(f"{PROG}: scope {normalised} recorded in {mcp_path}{_deny_note(deny)}")
-    else:
-        _out(f"{PROG}: scope already {normalised} in {mcp_path}{_deny_note(deny)}")
-    return normalised, EXIT_OK, True
-
-
-def _audit_path(config: config_mod.Config) -> Path:
-    """Where the launch log lives: the configured path, else the state default."""
-    if config.audit_path:
-        return Path(config.audit_path).expanduser()
-    return audit_mod.default_log_path()
-
-
-def _format_entry(entry: dict) -> str:
-    """Render one log entry as a single readable line."""
-    at = str(entry.get("at", "?"))
-    scope = str(entry.get("scope", "?"))
-    state = "enforced" if entry.get("enforced") else "NOT enforced"
-    target = entry.get("mcp_json") or "-"
-    return f"{at}  {scope}  {state}  {target}"
-
-
-def _record_launch(
-    config: config_mod.Config,
-    scope: str,
-    *,
-    enforced: bool,
-    mcp_path: Path | None,
-    kimi: str,
-    no_audit: bool,
-) -> None:
-    """Append this launch to the log, or say why it could not be written.
-
-    Never fatal. The log is a record *of* a launch, so refusing to launch
-    because the record could not be written would defeat the thing it records.
-    The warning goes to stderr, so a caller watching the exit code still sees a
-    successful launch.
-    """
-    if no_audit or not config.audit:
-        return
-
-    path = _audit_path(config)
-    entry = audit_mod.launch_entry(scope, enforced=enforced, mcp_json=mcp_path, kimi=kimi)
-    try:
-        audit_mod.record(path, entry)
-    except audit_mod.LogError as exc:
-        _warn(f"could not record this launch: {exc}")
-        _warn("the launch is continuing; set audit = false to silence this")
-
-
-def _launch_env(config: config_mod.Config, scope_value: str) -> dict[str, str]:
-    env = dict(os.environ)
-    env.setdefault("KIMI_CODE_IDENTITY_NAME", IDENTITY)
-    env.setdefault("KIMI_CODE_IDENTITY_SLUG", IDENTITY)
-    env.update(config.extra_env)
-    # Last, so a stray extra_env entry can never override the authorised scope.
-    env[mcpscope.SCOPE_ENV_KEY] = scope_value
-    return env
-
-
-def _split_tools(text: str | None) -> list[str] | None:
-    if not text:
-        return None
-    return [t for t in text.split(",") if t.strip()]
-
-
-def _split_seeds(raw: list[str]) -> list[str]:
-    """One seed per piece, whether separated by whitespace or commas.
-
-    Both `--osint a.example b.example` and `--osint a@x.example,b@y.example`
-    (and a trailing comma, which shells encourage) must yield clean seeds;
-    commas are never part of a legal seed, unlike the targets in --osint-accept
-    where they separate values.
-    """
-    seeds: list[str] = []
-    for seed in raw:
-        seeds.extend(part.strip() for part in seed.split(",") if part.strip())
-    return list(dict.fromkeys(seeds))
-
-
-def _osint_stage_and_select(args, config: config_mod.Config) -> int | None:
-    """Run the optional --osint stage and let the operator pick the scope.
-
-    Returns an exit code to bail out with, or None on success once ``args.scope``
-    carries the operator's selection. Findings are never auto-recorded: an
-    interactive run prompts, and --yes / non-tty runs require --osint-accept.
-    """
-    from . import osint as osint_mod
-
-    seeds = _split_seeds(args.osint)
-    if not seeds:
-        _warn("--osint needs at least one seed (domain, email, username, IP or phone)")
-        return EXIT_USAGE
-
-    interactive = not args.yes and sys.stdin.isatty() and args.osint_accept is None
-    if args.osint_accept is None and not interactive:
-        _warn("--osint chooses the scope interactively; pass --osint-accept \"value1,value2\" "
-              "to run without a prompt")
-        return EXIT_USAGE
-
-    def _event(message: str) -> None:
-        _out(f"{PROG}: osint {message}")
-
-    try:
-        findings = osint_mod.run_stage(
-            seeds,
-            python_bin=config.osint.resolved_python(),
-            script=config.osint.resolved_script(),
-            timeout_each=config.osint.timeout_each,
-            on_event=_event,
-        )
-    except osint_mod.McpConnectionError as exc:
-        _warn(str(exc))
-        _warn("nothing was launched; check `evilkit doctor` and the [osint] config table")
-        return EXIT_ERROR
-
-    findings_path = Path.cwd() / "osint-findings.json"
-    try:
-        osint_mod.write_findings(findings, findings_path)
-        _out(f"{PROG}: osint findings -> {findings_path}")
-    except OSError as exc:
-        _warn(f"osint: could not write {findings_path}: {exc}")
-
-    rows = osint_mod.candidate_table(findings)
-    display = rows[:OSINT_DISPLAY_LIMIT]
-    _out()
-    _out("OSINT findings:")
-    for number, value, kind, sources, eligible in display:
-        suffix = "" if eligible else "   (not scope-eligible)"
-        _out(f"  {number:>3}  {value:<44} {kind:<9} [{sources}]{suffix}")
-    if len(rows) > len(display):
-        _out(f"  ... {len(rows) - len(display)} more candidates in the findings file")
-    _out()
-
-    if args.osint_accept is not None:
-        accept_values = [v.strip() for v in args.osint_accept.split(",") if v.strip()]
-        _out(f"{PROG}: osint --osint-accept -> {args.osint_accept}")
-        by_value: dict[str, tuple] = {}
-        for row in rows:
-            by_value.setdefault(row[1].lower(), row)
-        picks: list[tuple] = []
-        for value in accept_values:
-            row = by_value.get(value.lower())
-            if row is None:
-                _warn(f"osint: {value!r} is not among the findings; skipped")
-                continue
-            picks.append(row)
-    else:
-        try:
-            chosen_text = input(
-                "select scope candidates (numbers or 1,3-5; 'a' = all shown; "
-                "enter = abort)> "
-            )
-        except (EOFError, KeyboardInterrupt):
-            _out()
-            chosen_text = ""
-        _out()
-
-        picked = osint_mod.parse_selection(chosen_text, len(display))
-        if picked is None:
-            _warn("aborted: nothing recorded, nothing launched")
-            return EXIT_ERROR
-        picks = [display[number - 1] for number in picked]
-
-    if not picks:
-        _warn("no valid selection: nothing recorded or launched")
-        return EXIT_ERROR
-
-    values: list[str] = []
-    for number, value, kind, _sources, eligible in picks:
-        if not eligible:
-            _warn(f"candidate {number} ({value}) is data about a person or platform, "
-                  "not something to authorise; skipped")
-            continue
-        try:
-            token = scope_mod.normalise_scope(value)
-        except scope_mod.ScopeError as exc:
-            _warn(f"candidate {number} ({value}) rejected by the scope parser ({exc}); skipped")
-            continue
-        if token not in values:
-            values.append(token)
-
-    if not values:
-        _warn("nothing picked could be authorised as a scope: nothing recorded or launched")
-        _warn("emails, usernames, phones and breach names are data ABOUT you, not hosts; "
-              "they can never be targets")
-        if picks:
-            _warn(f"your {len(picks)} pick(s) were all in that category; re-run with a domain "
-                  "you own added to the seeds, or skip the OSINT stage and run "
-                  "`evilkit -s <host-You-own>` directly")
-        return EXIT_ERROR
-
-    args.scope = ",".join(values)
-    _out(f"{PROG}: osint selection -> {args.scope}")
-    return None
-
-
-def _cmd_run(args, config: config_mod.Config, problems: list[str]) -> int:
-    for problem in problems:
-        _warn(problem)
-
-    if getattr(args, "osint", None) is not None:
-        code = _osint_stage_and_select(args, config)
-        if code is not None:
-            return code
-
-    raw_scope = _collect_scope(args, config)
-
-    try:
-        mcp_path = _resolve_mcp_path(args.mcp_json)
-    except mcpscope.McpNotFound as exc:
-        _warn(str(exc))
-        return EXIT_ERROR
-
-    write = not args.no_write and config.write_mcp_json
-
-    if getattr(args, "osint", None) is not None and not args.no_osint_mcp:
-        # Attach the passive osint MCP server alongside the recorded scope so
-        # the session itself can run public-source recon mid-run. Additive and
-        # best-effort: a failed attachment warns, it never blocks the launch.
-        attach_dry = bool(args.dry_run or args.no_write or not write)
-        if mcp_path is None:
-            if not attach_dry:
-                _warn("osint: no .mcp.json found; the session will not have the "
-                      "osint MCP server")
-        else:
-            try:
-                changed = mcpscope.ensure_osint_server(
-                    mcp_path,
-                    [config.osint.resolved_python(), config.osint.resolved_script()],
-                    keep_backups=config.backup_keep,
-                    dry_run=attach_dry,
-                )
-            except mcpscope.McpError as exc:
-                _warn(f"osint: could not attach the osint MCP server ({exc}); "
-                      "continuing without it")
-            else:
-                if attach_dry:
-                    state = "add" if changed else "leave"
-                    _out(f"{PROG}: would {state} the osint MCP server in {mcp_path}")
-                elif changed:
-                    _out(f"{PROG}: osint MCP server attached in {mcp_path}")
-                else:
-                    _out(f"{PROG}: osint MCP server already present in {mcp_path}")
-
-    if args.dry_run:
-        normalised, code, _ = _apply_scope(
-            raw_scope,
-            mcp_path,
-            config,
-            write=write,
-            allow_unscoped=args.allow_unscoped,
-            allow_any=args.allow_any,
-            dry_run=True,
-            deny_text=args.deny,
-        )
-        if code != EXIT_OK:
-            return code
-        _out(f"{PROG}: would launch {config.resolved_kimi_bin()}")
-        return EXIT_OK
-
-    # Resolve and check the launcher binary *before* committing the scope, so a
-    # missing Kimi CLI leaves the recorded scope exactly as it was rather than
-    # rewriting `.mcp.json` (possibly wider) for a launch that cannot start.
-    kimi = config.resolved_kimi_bin()
-    if not (Path(kimi).is_file() or shutil.which(kimi)):
-        _warn(f"cannot find the Kimi Code CLI ({kimi!r})")
-        _warn("install it, or set kimi_bin in your config, or export EVILKIT_KIMI_BIN")
-        return EXIT_ERROR
-
-    normalised, code, enforced = _apply_scope(
-        raw_scope,
-        mcp_path,
-        config,
-        write=write,
-        allow_unscoped=args.allow_unscoped,
-        allow_any=args.allow_any,
-        deny_text=args.deny,
-    )
-    if code != EXIT_OK:
-        return code
-
-    _record_launch(
-        config,
-        normalised,
-        enforced=enforced,
-        mcp_path=mcp_path,
-        kimi=kimi,
-        no_audit=args.no_audit,
-    )
-
-    passthrough = list(args.passthrough or [])
-    if passthrough and passthrough[0] == "--":
-        passthrough = passthrough[1:]
-
-    if enforced:
-        _out(f"{PROG}: authorized scope -> {normalised}")
-    else:
-        _out(f"{PROG}: scope -> {normalised} (NOT enforced; recorded scope is unchanged)")
-    env = _launch_env(config, normalised)
-    sys.stdout.flush()
-    sys.stderr.flush()
-    try:
-        os.execvpe(kimi, [kimi, *passthrough], env)
-    except OSError as exc:
-        _warn(f"could not start {kimi}: {exc}")
-        return EXIT_ERROR
-    return EXIT_OK
-
-
-#: Scope actions that change the record without launching anything.
-_SCOPE_EDITORS = frozenset({"set", "add", "remove"})
-
-
-def _cmd_scope(args, config: config_mod.Config) -> int:
-    action = args.scope_command or "show"
-    try:
-        mcp_path = _resolve_mcp_path(args.mcp_json)
-    except mcpscope.McpNotFound as exc:
-        _warn(str(exc))
-        return EXIT_ERROR
-
-    if mcp_path is None:
-        _warn("no .mcp.json found")
-        return EXIT_ERROR
-
-    if action in _SCOPE_EDITORS:
-        return _edit_scope(action, args, config, mcp_path)
-
-    if action == "clear":
-        target = scope_mod.SOLO_SCOPE
-        try:
-            changed = mcpscope.write_scope(mcp_path, target, keep_backups=config.backup_keep)
-        except mcpscope.McpError as exc:
-            _warn(str(exc))
-            return EXIT_ERROR
-        verb = "reset to" if changed else "already"
-        _out(f"{PROG}: {mcp_path} {verb} {target}")
-        return EXIT_OK
-
-    try:
-        current = mcpscope.read_scope(mcp_path)
-        denied = mcpscope.read_deny(mcp_path)
-    except mcpscope.McpError as exc:
-        _warn(str(exc))
-        return EXIT_ERROR
-    if current is None:
-        _warn(f"{mcp_path} declares no pentest server")
-        return EXIT_ERROR
-    _out(current)
-    # Only when one is recorded: a deny list nobody set must not change this
-    # command's output, which is read back as data by scripts.
-    if denied:
-        _out(f"deny: {denied}")
-    return EXIT_OK
-
-
-def _merge_scope(action: str, recorded: list[str], requested: list[str]) -> list[str]:
-    """Fold ``requested`` into ``recorded`` for an add or a remove.
-
-    The recorded order is kept, so a scope reads as the history of how it grew,
-    and a target already recorded is not repeated.
-    """
-    if action == "add":
-        known = set(recorded)
-        return [*recorded, *(token for token in requested if token not in known)]
-    dropped = set(requested)
-    return [token for token in recorded if token not in dropped]
-
-
-def _edit_scope(action: str, args, config: config_mod.Config, mcp_path: Path) -> int:
-    """Change the recorded scope in place, without launching the CLI.
-
-    A scope is meant to change mid-engagement — a host is added once the client
-    confirms it, or dropped when it is decommissioned — and re-running just to
-    repoint the file would also start a session. This edits the record alone,
-    through the same validated, atomic, backed-up write the launcher uses.
-    """
-    try:
-        requested = scope_mod.parse_scope(args.targets, allow_any=args.allow_any)
-    except scope_mod.ScopeError as exc:
-        _warn(f"{exc}")
-        _warn("expected a comma-separated list of hosts, IPs or CIDRs, or 'solo'")
-        return EXIT_USAGE
-
-    if action == "set":
-        # Deliberately no read: replacing a record needs nothing from it, and a
-        # file whose scope is already unreadable should still be fixable.
-        merged = list(requested)
-    else:
-        try:
-            current = mcpscope.read_scope(mcp_path)
-        except mcpscope.McpError as exc:
-            _warn(str(exc))
-            return EXIT_ERROR
-        if current is None:
-            if action == "remove":
-                _warn(f"nothing to remove: no scope is recorded in {mcp_path}")
-                return EXIT_ERROR
-            recorded: list[str] = []
-        else:
-            try:
-                # A /0 can only have been written deliberately, with --allow-any,
-                # so it must not disqualify the record from being merged.
-                recorded = scope_mod.parse_scope(current, allow_any=True)
-            except scope_mod.ScopeError as exc:
-                _warn(f"the scope recorded in {mcp_path} cannot be merged: {exc}")
-                _warn("use 'evilkit scope set' to replace it")
-                return EXIT_ERROR
-        merged = _merge_scope(action, recorded, requested)
-
-    if not merged:
-        _warn("that would leave no target at all; the record was left alone")
-        _warn("use 'evilkit scope clear' to reset to the locked-down default")
-        return EXIT_ERROR
-
-    target = ",".join(merged)
-    try:
-        changed = mcpscope.write_scope(
-            mcp_path, target, keep_backups=config.backup_keep, dry_run=args.dry_run
-        )
-    except mcpscope.McpError as exc:
-        _warn(str(exc))
-        return EXIT_ERROR
-
-    if args.dry_run:
-        if changed:
-            _out(f"{PROG}: would record {target} in {mcp_path}")
-        else:
-            _out(f"{PROG}: would leave {mcp_path} at {target}")
-    elif changed:
-        _out(f"{PROG}: scope {target} recorded in {mcp_path}")
-    else:
-        _out(f"{PROG}: scope already {target} in {mcp_path}")
-    return EXIT_OK
-
-
-def _cmd_log(args, config: config_mod.Config) -> int:
-    path = args.path.expanduser() if args.path is not None else _audit_path(config)
-    limit = args.limit if args.limit and args.limit > 0 else None
-
-    try:
-        entries, skipped = audit_mod.read(path, limit)
-    except audit_mod.LogError as exc:
-        _warn(str(exc))
-        return EXIT_ERROR
-
-    if not entries:
-        if skipped:
-            _warn(f"{path} holds no readable entries; {skipped} line(s) were skipped")
-            return EXIT_ERROR
-        # A fresh install has no log yet. That is a normal state, not a failure.
-        _out(f"{PROG}: no launches recorded yet ({path})")
-        return EXIT_OK
-
-    if args.json:
-        for entry in entries:
-            _out(audit_mod.to_line(entry))
-    else:
-        for entry in reversed(entries):
-            _out(_format_entry(entry))
-
-    if skipped:
-        _warn(f"{skipped} unreadable line(s) in {path} were skipped")
-    return EXIT_OK
-
-
-def _read_launches(path: Path, limit: int) -> tuple[list[dict], str]:
-    """The newest ``limit`` entries, and a note when the log cannot be read."""
-    if limit <= 0:
-        return [], ""
-    try:
-        entries, skipped = audit_mod.read(path, limit)
-    except audit_mod.LogError as exc:
-        return [], f"log unreadable ({exc})"
-    return entries, (f"{skipped} unreadable line(s) skipped" if skipped else "")
-
-
-def _cmd_watch(args, config: config_mod.Config) -> int:
-    """Follow the recorded scope for as long as the operator leaves the pane open.
-
-    Nothing here decides a scope or writes a file. The value is that the pane is
-    present at the moment the record changes — the moment a session quietly stops
-    being the one that was authorised. Exit is ``1`` if any alarm was raised, so
-    the same command works as a check in a script.
-    """
-    import time
-
-    try:
-        mcp_path = _resolve_mcp_path(args.mcp_json)
-    except mcpscope.McpNotFound as exc:
-        _warn(str(exc))
-        return EXIT_ERROR
-    if mcp_path is None:
-        _warn("no .mcp.json found; there is no recorded scope to watch")
-        return EXIT_ERROR
-
-    log_path = _audit_path(config)
-    interval = max(0.1, args.interval)
-    width = max(
-        60, min(shutil.get_terminal_size((watch_mod.DEFAULT_WIDTH, 24)).columns, 120)
-    )
-    interactive = sys.stdout.isatty()
-    color = not args.no_color and interactive and os.environ.get("NO_COLOR") is None
-
-    started = time.time()
-    state = watch_mod.snapshot(mcp_path)
-    alerts: list[watch_mod.Alert] = []
-
-    def frame() -> str:
-        launches, note = _read_launches(log_path, args.limit)
-        return watch_mod.render(
-            state,
-            launches,
-            alerts,
-            started=started,
-            now_ts=time.time(),
-            width=width,
-            color=color,
-            log_note=note,
-        )
-
-    if args.once:
-        # One plain frame and no cursor movement, so it can be piped or diffed.
-        _out(frame().rstrip("\n"))
-        return EXIT_OK
-
-    alarms = 0
-    try:
-        while True:
-            if interactive:
-                sys.stdout.write("\x1b[H\x1b[J")
-            sys.stdout.write(frame())
-            sys.stdout.flush()
-            time.sleep(interval)
-            sampled = watch_mod.snapshot(mcp_path)
-            change = watch_mod.compare(state, sampled)
-            if change is not None:
-                alerts.append(change)
-                if change.level == watch_mod.ALARM:
-                    alarms += 1
-            state = sampled
-    except KeyboardInterrupt:
-        _out()
-        _warn(f"watch stopped after {int(time.time() - started)}s with {alarms} alarm(s)")
-        return EXIT_ERROR if alarms else EXIT_OK
-
-
-def _cmd_doctor(config: config_mod.Config, problems: list[str]) -> int:
-    ok = True
-
-    kimi = config.resolved_kimi_bin()
-    kimi_found = bool(shutil.which(kimi)) or Path(kimi).is_file()
-    _out(f"kimi binary        : {kimi} {'ok' if kimi_found else 'MISSING'}")
-    ok &= kimi_found
-
-    if config.source:
-        config_state = "ok"
-    elif problems:
-        config_state = "unreadable (using defaults)"
-    else:
-        config_state = "absent (defaults)"
-    _out(f"config file        : {config_mod.config_path()} {config_state}")
-
-    try:
-        mcp_path = mcpscope.find()
-    except mcpscope.McpNotFound:
-        _out("mcp.json           : none in this directory tree")
-    else:
-        _out(f"mcp.json           : {mcp_path}")
-        try:
-            _out(f"recorded scope     : {mcpscope.read_scope(mcp_path) or 'none'}")
-        except mcpscope.McpError as exc:
-            _out(f"recorded scope     : unreadable ({exc})")
-            ok = False
-
-    installed = theme_mod.is_installed()
-    _out(f"theme installed    : {'yes' if installed else 'no'} ({theme_mod.kimi_themes_dir()})")
-
-    if not config.audit:
-        _out("audit log          : disabled")
-    else:
-        log_path = _audit_path(config)
-        try:
-            entries, skipped = audit_mod.read(log_path, limit=1)
-        except audit_mod.LogError as exc:
-            _out(f"audit log          : unreadable ({exc})")
-        else:
-            note = f"; {skipped} unreadable line(s) skipped" if skipped else ""
-            if not entries:
-                _out(f"audit log          : {log_path} (nothing recorded yet)")
-            else:
-                _out(f"audit log          : {log_path} (last launch {entries[-1].get('at', '?')}{note})")
-
-    osint_python = config.osint.resolved_python()
-    osint_script = config.osint.resolved_script()
-    osint_ok = Path(osint_python).is_file() and Path(osint_script).is_file()
-    _out(f"osint server      : {'available' if osint_ok else 'not installed (optional)'} "
-         f"({osint_script})")
-
-    for problem in problems:
-        _warn(problem)
-
-    return EXIT_OK if ok else EXIT_ERROR
-
-
-def _cmd_osint(args, config: config_mod.Config, problems: list[str]) -> int:
-    """Standalone passive recon: findings only, never a scope, never a launch."""
-    from . import osint as osint_mod
-
-    for problem in problems:
-        _warn(problem)
-
-    def _event(message: str) -> None:
-        _out(f"{PROG}: osint {message}")
-
-    try:
-        findings = osint_mod.run_stage(
-            _split_seeds(args.seeds),
-            python_bin=config.osint.resolved_python(),
-            script=config.osint.resolved_script(),
-            timeout_each=config.osint.timeout_each,
-            only=_split_tools(args.only),
-            skip=_split_tools(args.skip),
-            on_event=_event,
-        )
-    except osint_mod.McpConnectionError as exc:
-        _warn(str(exc))
-        _warn("check `evilkit doctor` and the [osint] table in your config")
-        return EXIT_ERROR
-
-    target = args.json_path if args.json_path is not None else Path.cwd() / "osint-findings.json"
-    try:
-        written = osint_mod.write_findings(findings, target)
-    except OSError as exc:
-        _warn(f"could not write {target}: {exc}")
-        written = None
-
-    rows = osint_mod.candidate_table(findings)
-    display = rows[:OSINT_DISPLAY_LIMIT]
-    _out()
-    _out("OSINT findings (passive public sources only; nothing was probed):")
-    for number, value, kind, sources, eligible in display:
-        suffix = "" if eligible else "   (not scope-eligible)"
-        _out(f"  {number:>3}  {value:<44} {kind:<9} [{sources}]{suffix}")
-    if len(rows) > len(display):
-        _out(f"  ... {len(rows) - len(display)} more candidates in the findings file")
-    eligible_count = sum(1 for row in rows if row[4])
-    _out()
-    if len(findings.get("runs", [])) == 0 and not rows:
-        _warn("no runs planned: check the seeds against `evilkit osint --help`")
-        return EXIT_ERROR
-    _out(f"{len(rows)} candidates ({eligible_count} scope-eligible)")
-    if written is None:
-        return EXIT_ERROR
-
-    if args.attach:
-        mcp_path = _resolve_mcp_path(None)
-        if mcp_path is None:
-            _warn("no .mcp.json here or in any parent directory; nothing to attach to")
-            return EXIT_ERROR
-        try:
-            changed = mcpscope.ensure_osint_server(
-                mcp_path,
-                [config.osint.resolved_python(), config.osint.resolved_script()],
-                keep_backups=config.backup_keep,
-            )
-        except mcpscope.McpError as exc:
-            _warn(f"could not attach the osint MCP server ({exc})")
-            return EXIT_ERROR
-        state = "attached in" if changed else "already attached to"
-        _out(f"{PROG}: osint MCP server {state} {mcp_path}")
-
-    _out(f"{PROG}: findings -> {written}")
-    return EXIT_OK
-
-
-def _cmd_theme(args) -> int:
-    if args.action == "install":
-        edited = theme_mod.is_modified()
-        already = theme_mod.is_installed()
-        try:
-            target = theme_mod.install(force=args.force)
-        except (OSError, ValueError, FileNotFoundError) as exc:
-            _warn(str(exc))
-            return EXIT_ERROR
-        if edited and not args.force:
-            _warn(f"{target} already exists and differs from the bundled theme")
-            _warn("re-run with --force to overwrite it")
-            return EXIT_ERROR
-        if already and not args.force:
-            # install() left the existing, identical file untouched: report that
-            # honestly rather than claiming a write that did not happen.
-            _out(f"{PROG}: theme already installed at {target} (unchanged)")
-            _out(f"{PROG}: set theme = \"{theme_mod.THEME_NAME}\" in your tui.toml to use it")
-            return EXIT_OK
-        _out(f"{PROG}: theme written to {target}")
-        _out(f"{PROG}: set theme = \"{theme_mod.THEME_NAME}\" in your tui.toml to use it")
-        return EXIT_OK
-
-    installed = theme_mod.is_installed()
-    state = "installed" if installed else "not installed"
-    _out(f"{theme_mod.THEME_NAME}: {state} ({theme_mod.kimi_themes_dir()})")
-    return EXIT_OK
-
-
-def _cmd_config(args, config: config_mod.Config, problems: list[str]) -> int:
-    action = args.config_command or "show"
-
-    if action == "path":
-        _out(str(config_mod.config_path()))
-        return EXIT_OK
-
-    if action == "init":
-        target = config_mod.config_path()
-        if target.exists():
-            _warn(f"{target} already exists; leaving it alone")
-            return EXIT_ERROR
-        try:
-            config_mod.save(config, target)
-        except OSError as exc:
-            _warn(f"could not write {target}: {exc}")
-            return EXIT_ERROR
-        _out(f"{PROG}: wrote {target}")
-        return EXIT_OK
-
-    _out(f"kimi_bin        = {config.kimi_bin}")
-    _out(f"default_scope   = {config.default_scope}")
-    _out(f"backup_keep     = {config.backup_keep}")
-    _out(f"write_mcp_json  = {str(config.write_mcp_json).lower()}")
-    resolved_log = _audit_path(config)
-    _out(f"audit           = {str(config.audit).lower()}")
-    _out(f"audit_path      = {resolved_log}{'' if config.audit_path else ' (default)'}")
-    _out(f"osint python    = {config.osint.python_bin}")
-    _out(f"osint script    = {config.osint.script}")
-    _out(f"osint timeout   = {config.osint.timeout_each:g}")
-    _out(f"config file     = {config.source or config_mod.config_path()}")
-    for problem in problems:
-        _warn(problem)
-    return EXIT_OK
-
-
-def _cmd_agent(args, config: config_mod.Config) -> int:
-    if args.list:
-        configs = agent_mod.builtin_configs()
-        if not configs:
-            _out("no built-in agent configs")
-            return EXIT_OK
-        for path in configs:
-            try:
-                ac = agent_mod.load_config(path)
-                _out(f"{ac.version}-{ac.name}  {path}")
-            except ValueError as exc:
-                _warn(f"{path}: {exc}")
-        return EXIT_OK
-
-    if not args.config:
-        _warn("--config is required (or use --list)")
-        return EXIT_USAGE
-    if not args.target:
-        _warn("--target is required")
-        return EXIT_USAGE
-    if ":" not in args.target:
-        _warn(f"--target must be HOST:PORT, got {args.target!r}")
-        return EXIT_USAGE
-
-    config_path = args.config.expanduser()
-    if not config_path.is_file():
-        _warn(f"config not found: {config_path}")
-        return EXIT_ERROR
-
-    # The agent path launches the Kimi CLI just like `run`, so it must be held to
-    # the same scope gate: enforce the recorded scope, inject it into the child's
-    # environment, and record the launch. Fail closed if there is no scope to
-    # enforce, so an agent run can never reach a target the record never authorised.
-    try:
-        mcp_path = _resolve_mcp_path(args.mcp_json)
-    except mcpscope.McpNotFound as exc:
-        _warn(str(exc))
-        return EXIT_ERROR
-    if mcp_path is None:
-        _warn("no .mcp.json here or in any parent directory; nothing to scope")
-        _warn("record a scope with `evilkit scope set ...` before running the agent")
-        return EXIT_ERROR
-
-    try:
-        recorded = mcpscope.read_scope(mcp_path)
-    except mcpscope.McpError as exc:
-        _warn(f"cannot read the recorded scope from {mcp_path}: {exc}")
-        return EXIT_ERROR
-    if not recorded:
-        _warn(f"{mcp_path} records no scope; set one before running the agent")
-        return EXIT_ERROR
-
-    if not scope_mod.target_in_scope(args.target, recorded):
-        _warn(f"--target {args.target!r} is not within the recorded scope ({recorded})")
-        _warn("widen the scope deliberately with `evilkit scope`, or pick an in-scope target")
-        return EXIT_ERROR
-
-    kimi_env = _launch_env(config, recorded)
-    _record_launch(
-        config,
-        recorded,
-        enforced=True,
-        mcp_path=mcp_path,
-        kimi=config.resolved_kimi_bin(),
-        no_audit=getattr(args, "no_audit", False),
-    )
-    _out(f"{PROG}: authorized scope -> {recorded}")
-
-    try:
-        return agent_mod.run(
-            config_path,
-            args.target,
-            interactive=args.interactive,
-            config=config,
-            env=kimi_env,
-        )
-    except ValueError as exc:
-        _warn(f"invalid agent config: {exc}")
-        return EXIT_ERROR
-    except FileNotFoundError as exc:
-        _warn(str(exc))
-        return EXIT_ERROR
-
-
 def main(argv: list[str] | None = None) -> int:
     raw = list(sys.argv[1:] if argv is None else argv)
+
+    # These adapters own their option syntax. Dispatch before this parser touches
+    # their arguments so new upstream flags continue to pass through unchanged.
+    if raw and raw[0] == "kimi":
+        from . import kimi
+        return kimi.main(raw[1:])
+    if raw and raw[0] == "qwen":
+        from . import qwen
+        return qwen.main(raw[1:])
+    if raw and raw[0] == "mesh":
+        from . import mesh
+        return mesh.main(raw[1:])
 
     # Split on the first standalone "--" by hand: everything after it belongs to
     # the Kimi Code CLI and must survive argparse untouched.
@@ -1335,29 +351,41 @@ def main(argv: list[str] | None = None) -> int:
         if args.command is None:
             parser.print_help()
             return EXIT_OK
-        _out(f"{PROG} {__version__}")
+        print(f"{PROG} {__version__}")
         return EXIT_OK
 
     config, problems = config_mod.load()
 
     if args.command == "run":
-        return _cmd_run(args, config, problems)
+        return commands.cmd_run(args, config, problems)
     if args.command == "osint":
-        return _cmd_osint(args, config, problems)
+        return commands.cmd_osint(args, config, problems)
+    if args.command == "patch-diff-poc":
+        return commands.cmd_patch_diff_poc(args, config, problems)
     if args.command == "scope":
-        return _cmd_scope(args, config)
+        return commands.cmd_scope(args, config)
     if args.command == "log":
-        return _cmd_log(args, config)
+        return commands.cmd_log(args, config)
     if args.command == "watch":
-        return _cmd_watch(args, config)
+        return commands.cmd_watch(args, config)
     if args.command == "doctor":
-        return _cmd_doctor(config, problems)
+        return commands.cmd_doctor(config, problems)
     if args.command == "theme":
-        return _cmd_theme(args)
+        return commands.cmd_theme(args)
     if args.command == "config":
-        return _cmd_config(args, config, problems)
+        return commands.cmd_config(args, config, problems)
     if args.command == "agent":
-        return _cmd_agent(args, config)
+        return commands.cmd_agent(args, config)
+    if args.command == "lessons":
+        return commands.cmd_lessons(args)
+    if args.command == "learn":
+        return commands.cmd_learn(args)
+    if args.command == "hooks":
+        return commands.cmd_hooks(args)
+    if args.command == "dashboard":
+        return commands.cmd_dashboard(args)
+    if args.command == "calls":
+        return commands.cmd_calls(args)
 
     parser.print_help()
     return EXIT_USAGE

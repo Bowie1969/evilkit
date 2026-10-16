@@ -36,11 +36,13 @@ __all__ = [
     "DENY_ENV_KEY",
     "SERVER_NAME",
     "OSINT_SERVER_NAME",
+    "DASHBOARD_SERVER_NAME",
     "find",
     "read_scope",
     "read_deny",
     "write_scope",
     "ensure_osint_server",
+    "ensure_dashboard_server",
     "prune_backups",
     "looks_like_backup",
 ]
@@ -49,6 +51,7 @@ SCOPE_ENV_KEY = "PENTEST_ALLOWED_TARGETS"
 DENY_ENV_KEY = "PENTEST_DENIED_TARGETS"
 SERVER_NAME = "pentest"
 OSINT_SERVER_NAME = "osint"
+DASHBOARD_SERVER_NAME = "dashboard"
 
 _BACKUP_RE = re.compile(r"\.(?P<stamp>\d{8}-\d{6})(?:-(?P<suffix>\d+))?\.bak$")
 
@@ -385,3 +388,46 @@ def ensure_osint_server(
             return False
         servers[OSINT_SERVER_NAME] = desired
         return _write_staged(path, data, keep_backups, dry_run=False)
+
+
+def ensure_dashboard_server(
+    path: Path, command: list[str], keep_backups: int = 5, dry_run: bool = False
+) -> bool:
+    """Declare the evilkit dashboard MCP server in ``path``.
+
+    ``command`` is ``[python, ...args]``; the entry is the stdio shape the Kimi
+    CLI loads. Unlike :func:`ensure_osint_server` the target may not exist yet:
+    the file the CLI reads at project level is ``.kimi-code/mcp.json``, which a
+    repository need not have, and an absent file is a fresh server map rather
+    than an error. Idempotent (False when already present and identical),
+    additive — the pentest server and every other key are preserved — and it
+    uses the same staged-write/backup machinery as :func:`write_scope`.
+    """
+    if not command or not command[0]:
+        raise McpError("dashboard server command must be [python, args...]")
+    # A symlinked file is refused for the same reason as in `_rewrite`: replacing
+    # it would leave the link's real target untouched, so the next launcher would
+    # start from a config this write only appeared to change.
+    if path.is_symlink():
+        raise McpError(f"{path} is a symlink; refusing to write the dashboard server through it")
+
+    desired = {"type": "stdio", "command": command[0], "args": list(command[1:])}
+    if dry_run:
+        if not path.is_file():
+            return True
+        data = _load(path)
+        servers = data.get("mcpServers")
+        return not (isinstance(servers, dict) and servers.get(DASHBOARD_SERVER_NAME) == desired)
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _locked(path):
+        existed = path.is_file()
+        data = _load(path) if existed else {"mcpServers": {}}
+        servers = data.setdefault("mcpServers", {})
+        if not isinstance(servers, dict):
+            raise McpError(f"{path}: 'mcpServers' is not an object")
+        if servers.get(DASHBOARD_SERVER_NAME) == desired:
+            return False
+        servers[DASHBOARD_SERVER_NAME] = desired
+        # There is nothing to back up when this write is what creates the file.
+        return _write_staged(path, data, keep_backups if existed else 0, dry_run=False)

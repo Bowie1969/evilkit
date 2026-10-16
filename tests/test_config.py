@@ -14,6 +14,7 @@ from _helpers import EvilkitTestCase  # noqa: E402
 
 from evilkit.config import (  # noqa: E402
     Config,
+    DashboardConfig,
     config_dir,
     config_path,
     dumps,
@@ -323,6 +324,102 @@ class TestExtraEnvKeys(EvilkitTestCase):
         loaded, problems = load()
         self.assertEqual(problems, [])
         self.assertEqual(loaded.extra_env, {"MY VAR": "1", "A.B": "2"})
+
+
+class TestDashboardConfig(EvilkitTestCase):
+    """The [dashboard] table: the lab run controls' URL, opt-in and timeout."""
+
+    def _load_text(self, text: str):
+        self.config_file.parent.mkdir(parents=True, exist_ok=True)
+        self.config_file.write_text(text, encoding="utf-8")
+        return load()
+
+    def test_defaults_attach_nothing(self):
+        # No default address: a guessed host would either fail obscurely or reach
+        # something that is not the board the operator meant.
+        dashboard = Config().dashboard
+        self.assertEqual(dashboard, DashboardConfig(url="", attach=False, timeout=5.0))
+        self.assertFalse(dashboard.enabled())
+
+    def test_a_configured_url_is_usable_and_trailing_slashes_are_dropped(self):
+        config, problems = self._load_text('[dashboard]\nurl = "http://10.0.0.9:8793/"\n')
+        self.assertEqual(problems, [])
+        self.assertEqual(config.dashboard.url, "http://10.0.0.9:8793")
+        self.assertTrue(config.dashboard.enabled())
+
+    def test_a_non_http_url_is_reported_and_dropped(self):
+        for text in ('url = "ftp://host:8793"\n', 'url = "10.0.0.9:8793"\n', "url = 8793\n"):
+            with self.subTest(text=text):
+                config, problems = self._load_text(f"[dashboard]\n{text}")
+                self.assertTrue(problems, text)
+                self.assertEqual(config.dashboard.url, "")
+
+    def test_auto_without_a_url_is_reported(self):
+        config, problems = self._load_text("[dashboard]\nauto = true\n")
+        self.assertTrue(config.dashboard.auto)
+        self.assertTrue(any("auto is true but url is empty" in problem for problem in problems), problems)
+
+    def test_auto_survives_save_then_load(self):
+        save(Config(dashboard=DashboardConfig(url="http://10.0.0.9:8793", attach=True, auto=True)),
+             self.config_file)
+        loaded, problems = load()
+        self.assertEqual(problems, [])
+        self.assertTrue(loaded.dashboard.auto)
+        self.assertTrue(loaded.dashboard.attach)
+
+    def test_attach_without_a_url_is_reported(self):
+        config, problems = self._load_text("[dashboard]\nattach = true\n")
+        self.assertTrue(config.dashboard.attach)
+        self.assertTrue(any("attach is true but url is empty" in problem for problem in problems), problems)
+
+    def test_wrong_typed_values_are_reported_without_crashing(self):
+        cases = {
+            'attach = "yes"\n': ("attach", "true or false"),
+            "auto = 1\n": ("auto", "true or false"),
+            "timeout = 0\n": ("timeout", "positive number"),
+            'timeout = "soon"\n': ("timeout", "positive number"),
+            "timeout = true\n": ("timeout", "positive number"),
+        }
+        for text, (key, fragment) in cases.items():
+            with self.subTest(text=text):
+                config, problems = self._load_text(f"[dashboard]\n{text}")
+                self.assertTrue(
+                    any(key in problem and fragment in problem for problem in problems),
+                    f"expected a {key!r} problem mentioning {fragment!r}, got {problems!r}",
+                )
+                self.assertEqual(config.dashboard, DashboardConfig())
+
+    def test_an_unknown_key_is_reported_but_harmless(self):
+        config, problems = self._load_text(
+            '[dashboard]\nurl = "http://10.0.0.9:8793"\ntypo = 1\n'
+        )
+        self.assertEqual(config.dashboard.url, "http://10.0.0.9:8793")
+        self.assertTrue(any("unknown [dashboard] key" in problem for problem in problems), problems)
+
+    def test_a_non_table_is_reported(self):
+        _, problems = self._load_text('dashboard = "http://10.0.0.9:8793"\n')
+        self.assertTrue(any("[dashboard] must be a table" in problem for problem in problems), problems)
+
+    def test_an_exported_url_wins_over_the_file(self):
+        config = Config(dashboard=DashboardConfig(url="http://from-file:8793", attach=True))
+        with mock.patch.dict(os.environ, {"EVILKIT_DASHBOARD_URL": "http://from-env:8793"}):
+            self.assertEqual(config.dashboard.resolved_url(), "http://from-env:8793")
+            self.assertTrue(config.dashboard.enabled())
+        with mock.patch.dict(os.environ, {"EVILKIT_DASHBOARD_URL": ""}):
+            self.assertEqual(config.dashboard.resolved_url(), "http://from-file:8793")
+
+    def test_the_table_survives_save_then_load(self):
+        save(Config(dashboard=DashboardConfig(url="http://10.0.0.9:8793", attach=True, timeout=2.5)),
+             self.config_file)
+        loaded, problems = load()
+        self.assertEqual(problems, [])
+        self.assertEqual(loaded.dashboard, DashboardConfig(url="http://10.0.0.9:8793",
+                                                           attach=True, timeout=2.5))
+
+    def test_the_dumped_table_parses(self):
+        parsed = tomllib.loads(dumps(Config()))
+        self.assertEqual(parsed["dashboard"],
+                         {"url": "", "attach": False, "auto": False, "timeout": 5})
 
 
 if __name__ == "__main__":

@@ -646,5 +646,90 @@ class TestEnsureOsintServer(McpscopeTestCase):
         self.assertEqual(data["mcpServers"]["osint"]["command"], "/elsewhere/python")
 
 
+class TestEnsureDashboardServer(McpscopeTestCase):
+    COMMAND = ["/opt/venv/bin/python3", "-m", "evilkit.dashboard_mcp"]
+
+    def kimi_path(self):
+        return self.tmp / ".kimi-code" / "mcp.json"
+
+    def kimi_backups(self):
+        return sorted(p.name for p in (self.tmp / ".kimi-code").glob("mcp.json*.bak"))
+
+    def test_it_creates_the_file_the_cli_reads_when_none_exists(self):
+        # `.kimi-code/mcp.json` is what the Kimi CLI loads, and a repository need
+        # not have one yet; the parent directory is created too.
+        path = self.kimi_path()
+        self.assertFalse(path.parent.exists())
+        self.assertTrue(mcpscope.ensure_dashboard_server(path, self.COMMAND))
+        self.assertEqual(
+            json.loads(path.read_text(encoding="utf-8"))["mcpServers"]["dashboard"],
+            {"type": "stdio", "command": self.COMMAND[0], "args": self.COMMAND[1:]},
+        )
+
+    def test_creating_the_file_leaves_no_backup_of_nothing(self):
+        self.assertTrue(mcpscope.ensure_dashboard_server(self.kimi_path(), self.COMMAND))
+        self.assertEqual(self.kimi_backups(), [])
+
+    def test_it_adds_beside_the_pentest_server_and_preserves_it(self):
+        path = self.write_mcp_json(self.pentest_fixture("10.0.0.0/24"))
+        self.assertTrue(mcpscope.ensure_dashboard_server(path, self.COMMAND))
+        data = json.loads(path.read_text(encoding="utf-8"))
+        self.assertIn("dashboard", data["mcpServers"])
+        self.assertEqual(mcpscope.read_scope(path), "10.0.0.0/24")
+        self.assertEqual(data["mcpServers"]["pentest"]["env"]["OTHER_ENV"], "keep-me")
+        self.assertEqual(len(self.backups()), 1)
+
+    def test_idempotent_when_the_entry_already_matches(self):
+        path = self.kimi_path()
+        mcpscope.ensure_dashboard_server(path, self.COMMAND)
+        before = path.read_text(encoding="utf-8")
+        self.assertFalse(mcpscope.ensure_dashboard_server(path, self.COMMAND))
+        self.assertEqual(path.read_text(encoding="utf-8"), before)
+        self.assertEqual(self.kimi_backups(), [])  # only the file-creating write
+
+    def test_dry_run_reports_without_writing(self):
+        path = self.write_mcp_json(self.pentest_fixture())
+        self.assertTrue(mcpscope.ensure_dashboard_server(path, self.COMMAND, dry_run=True))
+        self.assertNotIn("dashboard", json.loads(path.read_text(encoding="utf-8"))["mcpServers"])
+        self.assertEqual(self.backups(), [])
+
+    def test_dry_run_would_create_the_file_it_reports(self):
+        self.assertTrue(mcpscope.ensure_dashboard_server(self.kimi_path(), self.COMMAND, dry_run=True))
+        self.assertFalse(self.kimi_path().exists())
+
+    def test_dry_run_false_when_already_present(self):
+        path = self.kimi_path()
+        mcpscope.ensure_dashboard_server(path, self.COMMAND)
+        self.assertFalse(mcpscope.ensure_dashboard_server(path, self.COMMAND, dry_run=True))
+
+    def test_a_different_command_is_recorded(self):
+        path = self.kimi_path()
+        mcpscope.ensure_dashboard_server(path, self.COMMAND)
+        other = ["/elsewhere/python3", "-m", "evilkit.dashboard_mcp"]
+        self.assertTrue(mcpscope.ensure_dashboard_server(path, other))
+        data = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(data["mcpServers"]["dashboard"]["command"], "/elsewhere/python3")
+
+    def test_empty_command_is_refused(self):
+        with self.assertRaises(mcpscope.McpError):
+            mcpscope.ensure_dashboard_server(self.kimi_path(), [])
+
+    def test_a_symlinked_target_is_refused(self):
+        real = self.write_mcp_json({"mcpServers": {}}, name="real.json")
+        link = self.kimi_path()
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(real)
+        with self.assertRaises(mcpscope.McpError):
+            mcpscope.ensure_dashboard_server(link, self.COMMAND)
+        # Nothing was written through the link, and it is still a link.
+        self.assertEqual(json.loads(real.read_text(encoding="utf-8")), {"mcpServers": {}})
+        self.assertTrue(link.is_symlink())
+
+    def test_it_leaves_no_staging_file_behind(self):
+        path = self.kimi_path()
+        mcpscope.ensure_dashboard_server(path, self.COMMAND)
+        self.assertEqual(sorted(p.name for p in path.parent.glob("mcp.json.*.new")), [])
+
+
 if __name__ == "__main__":
     unittest.main()

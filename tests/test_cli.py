@@ -8,18 +8,21 @@ argv and launch environment it received.
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
+import socket
 import sys
 import unittest
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from _helpers import DENY_ENV_KEY, SCOPE_ENV_KEY, EvilkitTestCase  # noqa: E402
+from _helpers import DENY_ENV_KEY, SCOPE_ENV_KEY, EvilkitTestCase, StubDashboard  # noqa: E402
 
-from evilkit import __version__  # noqa: E402
+from evilkit import __version__, kimi  # noqa: E402
 from evilkit.cli import EXIT_ERROR, EXIT_OK, EXIT_USAGE  # noqa: E402
+from evilkit.kernel import launch_env  # noqa: E402
 
 
 class CliTestCase(EvilkitTestCase):
@@ -815,10 +818,9 @@ class TestExtraEnvCannotOverrideTheScope(CliTestCase):
         self.assertEqual(self.scope_in(path), "10.0.0.0/24")
 
     def test_the_launch_environment_is_scoped_even_if_a_config_is_hand_built(self):
-        from evilkit import cli
         from evilkit.config import Config
 
-        env = cli._launch_env(
+        env = launch_env(
             Config(extra_env={"PENTEST_ALLOWED_TARGETS": "0.0.0.0/0"}), "10.0.0.0/24"
         )
 
@@ -954,6 +956,289 @@ class TestFixedRegressions(CliTestCase):
         code, out, _ = self.call_main(["-s", "solo", "-y", "-n", "--strict"])
 
         self.assertEqual(code, EXIT_ERROR, f"dry run should preview the fatal error, said: {out!r}")
+
+
+class TestDashboardAttach(CliTestCase):
+    """Declaring the dashboard's run-control MCP server at launch time.
+
+    The file that matters is the one the engine reads. For the Kimi CLI that is
+    ``<project>/.kimi-code/mcp.json`` (or the user-level file outside a
+    repository) -- a plain ``.mcp.json`` is ignored by the CLI entirely, so an
+    entry there would look attached and start nothing.
+
+    Every test launches from inside a repository it created itself: the CLI's
+    project rule walks *ancestors*, so a directory above the temp tree that
+    happens to contain a ``.git`` would otherwise decide where the write lands.
+    """
+
+    KIMI_URL = '[dashboard]\nurl = "http://10.0.0.9:8793"\nattach = true\n'
+
+    def write_config(self, text: str):
+        self.config_file.parent.mkdir(parents=True, exist_ok=True)
+        self.config_file.write_text(text, encoding="utf-8")
+
+    def project(self):
+        """A repository root inside the temp tree, for a deterministic target."""
+        project = self.tmp / "engagement"
+        (project / ".git").mkdir(parents=True, exist_ok=True)
+        return project
+
+    def servers_in(self, path):
+        return json.loads(path.read_text(encoding="utf-8"))["mcpServers"]
+
+    def kimi_file(self, project):
+        return project / ".kimi-code" / "mcp.json"
+
+    def kimi_user_file(self):
+        return self.kimi_home / "mcp.json"
+
+    def launch(self, *argv, cwd=None, env=None):
+        return self.run_cli(
+            ["kimi", "--scope", "10.99.50.0/24", "--allow-unscoped", "--skip-preflight", *argv],
+            cwd=cwd,
+            env=env,
+        )
+
+    def test_the_project_file_is_what_the_launch_declares_it_in(self):
+        self.write_config(self.KIMI_URL)
+        project = self.project()
+
+        proc = self.launch(cwd=project)
+
+        self.assertEqual(proc.returncode, EXIT_OK, proc.stderr)
+        entry = self.servers_in(self.kimi_file(project))["dashboard"]
+        self.assertEqual(entry["type"], "stdio")
+        self.assertEqual(entry["args"], ["-m", "evilkit.dashboard_mcp"])
+        self.assertEqual(entry["command"], sys.executable)
+        self.assertIn("dashboard MCP server attached", proc.stdout)
+        # The user-level file is not touched when the project file is the one read.
+        self.assertFalse(self.kimi_user_file().exists())
+
+    def test_a_plain_dot_mcp_json_is_never_the_default_target(self):
+        # Regression guard: the Kimi CLI does not read .mcp.json, so attaching
+        # there would report success while the session got no run controls.
+        self.write_config(self.KIMI_URL)
+        project = self.project()
+        plain = project / ".mcp.json"
+        plain.write_text(json.dumps({"mcpServers": {}}, indent=2) + "\n", encoding="utf-8")
+
+        proc = self.launch(cwd=project)
+
+        self.assertEqual(proc.returncode, EXIT_OK, proc.stderr)
+        self.assertEqual(self.servers_in(plain), {})
+        self.assertIn("dashboard", self.servers_in(self.kimi_file(project)))
+
+    def test_an_explicit_mcp_json_is_honoured(self):
+        self.write_config(self.KIMI_URL)
+        project = self.project()
+        explicit = self.tmp / "explicit.json"
+        explicit.write_text(json.dumps({"mcpServers": {}}), encoding="utf-8")
+
+        proc = self.launch("--mcp-json", str(explicit), cwd=project)
+
+        self.assertEqual(proc.returncode, EXIT_OK, proc.stderr)
+        self.assertIn("dashboard", self.servers_in(explicit))
+        self.assertFalse(self.kimi_file(project).exists())
+
+    def test_the_default_path_prefers_the_project_file_then_the_user_file(self):
+        args = argparse.Namespace(mcp_json=None)
+        user = self.kimi_user_file()
+        project_file = self.kimi_file(self.project())
+        with mock.patch.object(kimi, "kimi_project_mcp_path", return_value=project_file):
+            self.assertEqual(kimi._dashboard_mcp_path(args), project_file)
+        with mock.patch.object(kimi, "kimi_project_mcp_path", return_value=None), \
+             mock.patch.object(kimi, "kimi_user_mcp_path", return_value=user):
+            self.assertEqual(kimi._dashboard_mcp_path(args), user)
+
+    def test_no_dashboard_mcp_opt_out_writes_nothing(self):
+        self.write_config(self.KIMI_URL)
+        project = self.project()
+
+        proc = self.launch("--no-dashboard-mcp", cwd=project)
+
+        self.assertEqual(proc.returncode, EXIT_OK, proc.stderr)
+        self.assertNotIn("dashboard MCP server", proc.stdout)
+        self.assertFalse(self.kimi_file(project).exists())
+
+    def test_the_flag_attaches_without_the_config_asking(self):
+        self.write_config('[dashboard]\nurl = "http://10.0.0.9:8793"\n')
+        project = self.project()
+
+        proc = self.launch("--attach-dashboard", cwd=project)
+
+        self.assertEqual(proc.returncode, EXIT_OK, proc.stderr)
+        self.assertIn("dashboard", self.servers_in(self.kimi_file(project)))
+
+    def test_a_dry_run_reports_without_writing(self):
+        self.write_config(self.KIMI_URL)
+        project = self.project()
+
+        proc = self.run_cli(
+            ["kimi", "--scope", "10.99.50.0/24", "--no-write", "--dry-run"], cwd=project
+        )
+
+        self.assertEqual(proc.returncode, EXIT_OK, proc.stderr)
+        self.assertIn("would add the dashboard MCP server", proc.stdout)
+        self.assertFalse(self.kimi_file(project).exists())
+
+    def test_attach_without_a_url_is_refused_rather_than_attached(self):
+        self.write_config("[dashboard]\nattach = true\n")
+        project = self.project()
+
+        proc = self.launch(cwd=project)
+
+        self.assertEqual(proc.returncode, EXIT_OK, proc.stderr)
+        self.assertFalse(self.kimi_file(project).exists())
+        self.assertIn("attach is set but no url is", proc.stderr)
+
+    def test_the_board_url_and_timeout_reach_the_session_environment(self):
+        stub = self.tmp / "env" / "kimi-env-stub"
+        stub.write_text(
+            "#!/bin/sh\n"
+            "printf 'dashurl:%s\\n' \"${EVILKIT_DASHBOARD_URL-unset}\"\n"
+            "printf 'dashtimeout:%s\\n' \"${EVILKIT_DASHBOARD_TIMEOUT-unset}\"\n",
+            encoding="utf-8",
+        )
+        stub.chmod(0o755)
+        self.write_config(
+            '[dashboard]\nurl = "http://10.0.0.9:8793"\nattach = true\ntimeout = 2\n'
+        )
+
+        proc = self.launch(cwd=self.project(), env={"EVILKIT_KIMI_BIN": str(stub)})
+
+        self.assertEqual(proc.returncode, EXIT_OK, proc.stderr)
+        self.assertIn("dashurl:http://10.0.0.9:8793", proc.stdout)
+        self.assertIn("dashtimeout:2", proc.stdout)
+
+    def test_preflight_reports_the_dashboard_server_as_optional(self):
+        # The adapters list "dashboard" in OPTIONAL_SERVERS, so a session running
+        # without the run controls is told about it rather than blocked by it.
+        self.write_config('[dashboard]\nurl = "http://10.0.0.9:8793"\n')
+        project = self.project()
+        (project / ".kimi-code").mkdir(parents=True, exist_ok=True)
+        (project / ".kimi-code" / "mcp.json").write_text(
+            json.dumps(self.pentest_fixture("10.99.50.0/24")), encoding="utf-8"
+        )
+
+        proc = self.run_cli(["kimi", "--scope", "10.99.50.0/24"], cwd=project)
+
+        self.assertEqual(proc.returncode, EXIT_OK, proc.stderr)
+        combined = proc.stdout + proc.stderr
+        self.assertIn("optional MCP servers not configured", combined)
+        self.assertIn("dashboard", combined)
+
+    def test_qwen_attaches_to_the_project_mcp_json(self):
+        # The Qwen adapter reads the project .mcp.json (see _gather_mcp_servers),
+        # so that is where its run controls have to be declared.
+        self.write_config(self.KIMI_URL)
+        project = self.project()
+        path = project / ".mcp.json"
+        path.write_text(json.dumps(self.pentest_fixture("10.0.0.0/24"), indent=2) + "\n",
+                        encoding="utf-8")
+
+        proc = self.run_cli(
+            ["qwen", "--scope", "10.99.50.0/24", "--skip-preflight", "--no-supervise"],
+            cwd=project,
+            env={"EVILQWEN_BIN": str(self.stub)},
+        )
+
+        self.assertEqual(proc.returncode, EXIT_OK, proc.stderr)
+        data = json.loads(path.read_text(encoding="utf-8"))
+        self.assertIn("dashboard", data["mcpServers"])
+        # The scope write is unaffected: the launched scope is the recorded one.
+        self.assertEqual(self.scope_in(path), "10.99.50.0/24")
+        # The pentest server the fixture declared is preserved.
+        self.assertEqual(data["mcpServers"]["pentest"]["env"]["OTHER_ENV"], "keep-me")
+
+
+class TestDashboardAuto(CliTestCase):
+    """``[dashboard] auto``: the run goes on the board at launch and off at exit.
+
+    The board is a loopback stub, so what these prove is the real sequence the
+    launcher performs — POST start before the session, POST stop only after it —
+    and that a board which can't be reached never blocks a launch.
+    """
+
+    AUTO = '[dashboard]\nurl = "{url}"\nattach = true\nauto = true\n'
+    TRACKED = {"control_run": {"action": "start", "status": "succeeded", "pid": 1}}
+
+    def write_config(self, text: str):
+        self.config_file.parent.mkdir(parents=True, exist_ok=True)
+        self.config_file.write_text(text, encoding="utf-8")
+
+    def project(self):
+        project = self.tmp / "engagement"
+        (project / ".git").mkdir(parents=True, exist_ok=True)
+        return project
+
+    def launch(self, *argv, cwd=None):
+        return self.run_cli(
+            ["kimi", "--scope", "10.99.50.0/24", "--allow-unscoped", "--skip-preflight", *argv],
+            cwd=cwd or self.project(),
+        )
+
+    def test_the_run_goes_on_the_board_and_comes_off_when_the_session_ends(self):
+        with StubDashboard() as board:
+            self.write_config(self.AUTO.format(url=board.url))
+            proc = self.launch()
+        self.assertEqual(proc.returncode, EXIT_OK, proc.stderr)
+        self.assertEqual(board.posts(), ["/api/run/start", "/api/run/stop"])
+        self.assertIn("run tracking started on the board", proc.stdout)
+        self.assertIn("run tracking stopped on the board", proc.stdout)
+
+    def test_a_board_already_tracking_a_run_is_left_alone(self):
+        sample = {"control_run": {"action": "start", "status": "succeeded", "pid": 9}}
+        with StubDashboard({"/api/status": (200, sample)}) as board:
+            self.write_config(self.AUTO.format(url=board.url))
+            proc = self.launch()
+        self.assertEqual(proc.returncode, EXIT_OK, proc.stderr)
+        # Nothing was started, so nothing is this launch's to stop.
+        self.assertEqual(board.posts(), [])
+        self.assertIn("a run is already being tracked", proc.stdout)
+
+    def test_a_failed_start_is_not_this_launch_s_to_stop(self):
+        payload = {"status": "failed", "pid": 5,
+                   "message": "Start failed (exit 1) — a run is already being tracked: 20261015-x"}
+        with StubDashboard({"/api/run/start": (200, payload)}) as board:
+            self.write_config(self.AUTO.format(url=board.url))
+            proc = self.launch()
+        self.assertEqual(proc.returncode, EXIT_OK, proc.stderr)
+        self.assertEqual(board.posts(), ["/api/run/start"])
+        self.assertIn("run tracking failed", proc.stderr)
+
+    def test_no_dashboard_mcp_turns_the_automation_off_too(self):
+        with StubDashboard() as board:
+            self.write_config(self.AUTO.format(url=board.url))
+            proc = self.launch("--no-dashboard-mcp")
+        self.assertEqual(proc.returncode, EXIT_OK, proc.stderr)
+        self.assertEqual(board.posts(), [])
+
+    def test_no_supervise_starts_tracking_and_says_it_cannot_stop_it(self):
+        with StubDashboard() as board:
+            self.write_config(self.AUTO.format(url=board.url))
+            proc = self.launch("--no-supervise")
+        self.assertEqual(proc.returncode, EXIT_OK, proc.stderr)
+        self.assertEqual(board.posts(), ["/api/run/start"])
+        self.assertIn("nothing will survive this launch", proc.stderr)
+
+    def test_an_unreachable_board_never_blocks_the_launch(self):
+        probe = socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        probe.close()
+        self.write_config(self.AUTO.format(url=f"http://127.0.0.1:{port}"))
+
+        proc = self.launch()
+
+        self.assertEqual(proc.returncode, EXIT_OK, proc.stderr)
+        self.assertIn("run tracking was not started", proc.stderr)
+
+    def test_auto_off_means_no_control_calls_at_all(self):
+        with StubDashboard() as board:
+            self.write_config(f'[dashboard]\nurl = "{board.url}"\nattach = true\n')
+            proc = self.launch()
+        self.assertEqual(proc.returncode, EXIT_OK, proc.stderr)
+        self.assertEqual(board.posts(), [])
 
 
 if __name__ == "__main__":

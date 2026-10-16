@@ -10,6 +10,18 @@ venv/
 .mypy_cache/
 .ruff_cache/
 
+# Engagement output is sensitive runtime data, never source material.
+runs/
+evidence/keystone-run*/
+variants/evilqwen/evidence/turn-*.json
+**/learning_ledger.jsonl
+
+# Mesh enrollment and local operator state contain private addresses/tokens.
+.evilkit-mesh/
+**/.evilkit-mesh/
+connection.json
+clone-display.jsonl
+
 # Never commit a real project config: it holds authorized scopes and tokens.
 # Backups, mkstemp staging files and the sidecar lock file are written beside
 # the target, so every pattern has to cover any *.mcp.json basename and not

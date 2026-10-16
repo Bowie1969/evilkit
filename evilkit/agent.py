@@ -6,7 +6,7 @@ A config is a TOML file with:
     name = "baseline"
     system_prompt = "You are a security tester..."
     methodology = "1. Reconnaissance..."
-    tool_suggestions = "Prefer curl and nmap..."
+    tool_suggestions = "Prefer curl and rustscan..."
     output_format = "Print each finding as: FOUND ..."
     follow_up_prompt = "What would you do next?"
 

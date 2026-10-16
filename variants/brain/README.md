@@ -2,8 +2,7 @@
 
 A scope-gated launcher for the Kimi Code CLI.
 
-<!-- TODO(owner): replace with the live Gumroad product URL -->
-**[Buy evilkit](https://gumroad.com/l/REPLACE-ME)** — per-seat licence, includes updates.
+Commercial licensing enquiries: **fullchecksecurity@gmail.com**.
 
 evilkit records one thing — the authorized target scope — in the right place, then hands over to
 the Kimi Code CLI. On each launch it collects a scope from `--scope`, an interactive prompt, or a
@@ -764,8 +763,7 @@ point `--mcp-json` at a file you wrote yourself.
 evilkit is proprietary, commercial, source-available software licensed under the
 [EvilKit Commercial License](LICENSE). It is licensed, not sold.
 
-<!-- TODO(owner): replace with the live Gumroad product URL -->
-**[Buy evilkit](https://gumroad.com/l/REPLACE-ME)** — per-seat licence, includes updates.
+Commercial licensing enquiries: **fullchecksecurity@gmail.com**.
 
 In short, from the licence text:
 

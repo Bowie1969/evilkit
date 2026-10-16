@@ -10,10 +10,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 
-DEFAULT_RANGE_ROOT = Path(
-    "/home/will_cyber/orca/workspaces/home lab/"
-    "Most-Dangerous-Thing-We-Can-Build-And-Test-Safetly"
-)
+DEFAULT_RANGE_ROOT = Path(".")
 DEFAULT_CAGE_ROOT = Path(".chainbreaker/cage")
 DEFAULT_MANIFEST = Path("campaign/chainbreaker.json")
 DEFAULT_SPEC = Path("range/compose.json")

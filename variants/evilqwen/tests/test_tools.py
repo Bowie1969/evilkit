@@ -71,6 +71,12 @@ class TestSimulationExecutor(EvilkitTestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("outside", result.stderr)
 
+    def test_rustscan_loopback_returns_ports(self):
+        exe = SimulationExecutor(["127.0.0.1/32"])
+        result = exe.execute("rustscan -a 127.0.0.1")
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("Open 127.0.0.1:22", result.stdout)
+
     def test_nmap_loopback_returns_ports(self):
         exe = SimulationExecutor(["127.0.0.1/32"])
         result = exe.execute("nmap -sV 127.0.0.1")

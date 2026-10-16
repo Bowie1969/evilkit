@@ -979,8 +979,15 @@ class _MultiChannelC2Impl:
 
         self.test_result = "failover_test: " + " | ".join(results)
 
-    async def start(self):
-        """Start all C2 channels."""
+    async def start(self, hold: bool = False):
+        """Start all C2 channels.
+
+        ``hold`` keeps the listeners running after the report is built, which
+        only means anything while the process stays alive. The default releases
+        them: a single stdio tool call cannot hold a live listener open, and the
+        unconditional ``while True`` this replaced made every non-failover call
+        die on the client's call budget with no report at all.
+        """
         if self.test_failover:
             await self._test_failover()
             return
@@ -997,11 +1004,16 @@ class _MultiChannelC2Impl:
         else:
             self.primary_channel = "none"
 
-        self.test_result = "all_channels_started"
+        self.test_result = (
+            "all_channels_started"
+            if hold
+            else "all_channels_started (report only — listeners released when the call returns; "
+                 "pass hold=true to keep them up)"
+        )
 
-        # Keep running
-        while True:
-            await asyncio.sleep(1)
+        if hold:
+            while True:
+                await asyncio.sleep(1)
 
     def build_report(self) -> MultiChannelC2Report:
         return MultiChannelC2Report(
@@ -1020,12 +1032,18 @@ def create_multi_channel_c2(
     icmp_host: str = "0.0.0.0",
     http_url: str = "",
     test_failover: bool = False,
+    hold: bool = False,
 ) -> MultiChannelC2Report:
     """Start all C2 channels with auto-failover.
 
     Starts TCP, DNS, and ICMP channels. If test_failover is True,
     actually starts real servers, connects test clients, kills each channel
     in sequence, and verifies failover to the next channel works.
+
+    With ``hold`` false (the default) the listeners are released as soon as the
+    report is built, and ``test_result`` says so. ``hold`` true keeps them
+    running and does not return — only useful when the caller owns a process
+    that stays alive.
 
     Returns a MultiChannelC2Report showing which channels are active
     and the failover order.
@@ -1046,8 +1064,8 @@ def create_multi_channel_c2(
         loop = None
 
     if loop and loop.is_running():
-        loop.create_task(impl.start())
+        loop.create_task(impl.start(hold=hold))
         return impl.build_report()
     else:
-        asyncio.run(impl.start())
+        asyncio.run(impl.start(hold=hold))
         return impl.build_report()

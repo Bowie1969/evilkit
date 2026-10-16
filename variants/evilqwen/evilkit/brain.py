@@ -166,7 +166,27 @@ def _update_state_from_output(state: MissionState, command: str, output: str) ->
             add_host(state, target, evidence_ref=ref)
             update_coverage(state, target, "icmp", "recon")
 
-    # Nmap open ports -> services.
+    # RustScan open ports -> services.
+    if "rustscan" in lower:
+        target = _first_target(lower, output)
+        if target:
+            ref = len(state.evidence) - 1
+            add_host(state, target, evidence_ref=ref)
+            for line in output.splitlines():
+                match = re.match(r"^Open\s+\S+:(\d+)\s*$", line)
+                if match:
+                    port = match.group(1)
+                    add_service(
+                        state,
+                        target,
+                        int(port),
+                        "tcp",
+                        name="unknown",
+                        evidence_ref=ref,
+                    )
+                    update_coverage(state, target, f"{port}/tcp", "enumeration")
+
+    # Nmap open ports -> services (retained for UDP sweeps).
     if "nmap" in lower:
         target = _first_target(lower, output)
         if target:
@@ -222,9 +242,9 @@ def _default_operator_response(state_summary: str, turn: int) -> dict:
         }
     return {
         "goal": "enumerate services on known host",
-        "command": "nmap -sV 127.0.0.1",
-        "expected_result": "list of open ports and services",
-        "reasoning": "after confirming host is up, enumerate services",
+        "command": "rustscan -a 127.0.0.1",
+        "expected_result": "list of open TCP ports",
+        "reasoning": "after confirming host is up, enumerate open ports",
     }
 
 

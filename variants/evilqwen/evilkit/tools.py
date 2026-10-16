@@ -44,6 +44,7 @@ class Executor(Protocol):
 _FORBIDDEN_SHELL_CHARS = re.compile(r"[&$`\(\)\{\}\[\]<>~^#\n\r]")
 _ALLOWLIST = frozenset({
     "ping",
+    "rustscan",
     "nmap",
     "traceroute",
     "tracepath",
@@ -267,7 +268,28 @@ class SimulationExecutor:
                 stderr=f"Request timeout for icmp_seq=1 (simulated {target})",
             )
 
+        if tool == "rustscan":
+            if self._is_loopback(target):
+                return ExecutionResult(
+                    command=command,
+                    returncode=0,
+                    stdout=(
+                        f"Starting RustScan against {target}\n"
+                        f"Open {target}:22\n"
+                        f"Open {target}:80\n"
+                    ),
+                    stderr="",
+                )
+            return ExecutionResult(
+                command=command,
+                returncode=0,
+                stdout=f"Starting RustScan against {target}\nNo open ports found (simulated)\n",
+                stderr="",
+            )
+
         if tool == "nmap":
+            # nmap is retained for UDP sweeps and NSE vuln scripts that
+            # rustscan cannot perform.
             if self._is_loopback(target):
                 return ExecutionResult(
                     command=command,

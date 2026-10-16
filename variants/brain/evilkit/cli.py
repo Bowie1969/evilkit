@@ -8,7 +8,7 @@ import shutil
 import sys
 from pathlib import Path
 
-from . import __version__, brain as brain_mod, config as config_mod, mcpscope, scope as scope_mod, theme as theme_mod
+from . import __version__, brain as brain_mod, config as config_mod, lessons as lessons_mod, mcpscope, scope as scope_mod, theme as theme_mod
 from .tools import Executor
 
 __all__ = ["main", "build_parser"]
@@ -20,7 +20,7 @@ EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_USAGE = 2
 
-COMMANDS = ("run", "brain", "scope", "doctor", "theme", "config", "version")
+COMMANDS = ("run", "brain", "scope", "doctor", "theme", "config", "version", "lessons", "learn")
 
 _EPILOG = """\
 examples:
@@ -166,6 +166,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="use canned model responses instead of calling a real API",
     )
+    brain_cmd.add_argument(
+        "--no-learn",
+        action="store_true",
+        help="do not score this run or distil lessons from it",
+    )
 
     scope_cmd = sub.add_parser("scope", help="inspect or reset the recorded scope")
     scope_sub = scope_cmd.add_subparsers(dest="scope_command", metavar="ACTION")
@@ -190,6 +195,21 @@ def build_parser() -> argparse.ArgumentParser:
     config_sub.add_parser("init", help="write a commented default config file")
 
     sub.add_parser("version", help="print the version")
+
+    lessons_cmd = sub.add_parser("lessons", help="manage iterative operator lessons")
+    lessons_sub = lessons_cmd.add_subparsers(dest="lessons_command", metavar="ACTION")
+    lessons_sub.add_parser("show", help="print the lessons injected into the operator prompt")
+    lessons_sub.add_parser("path", help="print the lessons file path")
+    lessons_add = lessons_sub.add_parser("add", help="append a lesson learned from the latest run")
+    lessons_add.add_argument("title", help="short lesson title")
+    lessons_add.add_argument("body", help="lesson body (one paragraph, evidence-grounded)")
+    lessons_add.add_argument("--source", help="source run id or date (defaults to today)")
+
+    learn_cmd = sub.add_parser("learn", help="inspect the self-training loop")
+    learn_sub = learn_cmd.add_subparsers(dest="learn_command", metavar="ACTION")
+    learn_cmd.set_defaults(learn_command=None)
+    learn_sub.add_parser("status", help="show mean score per lessons generation")
+    learn_sub.add_parser("rollback", help="remove the most recently auto-added lessons batch")
 
     return parser
 
@@ -484,7 +504,95 @@ def _cmd_brain(args, config: config_mod.Config, problems: list[str]) -> int:
         _out(line)
 
     _out(f"{PROG}: brain finished: {result.state.completion_reason}")
+
+    if not getattr(args, "no_learn", False):
+        _learn_from_result(args, controller, result)
+
     return EXIT_OK
+
+
+def _learn_from_result(args, controller, result) -> None:
+    """Score the finished run and distil lessons. Never fatal — like the audit log."""
+    from . import learning as learning_mod
+    from .scoring import score_run
+
+    try:
+        run_id = ""
+        if getattr(args, "trace_path", None):
+            run_id = Path(args.trace_path).stem
+        elif getattr(args, "state_path", None):
+            run_id = Path(args.state_path).stem
+        score = score_run(result.state, controller, run_id=run_id)
+        report = learning_mod.learn_from_run(score)
+        _out(learning_mod.format_report(report))
+    except Exception as exc:  # self-training must never sink a completed run
+        _warn(f"self-training skipped: {exc}")
+
+
+def _cmd_lessons(args) -> int:
+    action = args.lessons_command or "show"
+
+    if action == "path":
+        _out(str(lessons_mod.lessons_path()))
+        return EXIT_OK
+
+    if action == "show":
+        body = lessons_mod.load_lessons()
+        if not body.strip():
+            _warn("no lessons recorded yet")
+            return EXIT_ERROR
+        _out(body.rstrip())
+        return EXIT_OK
+
+    if action == "add":
+        try:
+            number = lessons_mod.append_lesson(args.title, args.body, source=args.source)
+        except ValueError as exc:
+            _warn(str(exc))
+            return EXIT_USAGE
+        _out(f"{PROG}: appended lesson L{number} to {lessons_mod.lessons_path()}")
+        return EXIT_OK
+
+    _warn(f"unknown lessons action: {action}")
+    return EXIT_USAGE
+
+
+def _cmd_learn(args) -> int:
+    from . import learning as learning_mod
+
+    action = args.learn_command or "status"
+
+    if action == "status":
+        summary = learning_mod.generation_summary()
+        if not summary:
+            _warn("no runs recorded yet; run `evilkit brain` to start learning")
+            return EXIT_ERROR
+        _out("lessons generation          runs  mean  change")
+        for gen in summary:
+            delta = "" if gen["delta"] is None else f"{gen['delta']:+}"
+            flag = ""
+            if gen["delta"] is not None and gen["delta"] < 0:
+                flag = "  <- regressed; `evilkit learn rollback` to revert"
+            _out(
+                f"  {gen['fingerprint']:<24}{gen['runs']:>4}{gen['mean_overall']:>7}"
+                f"{delta:>8}{flag}"
+            )
+        return EXIT_OK
+
+    if action == "rollback":
+        batch, numbers = learning_mod.rollback_last_batch()
+        if not batch:
+            _warn("no auto-added lessons batch to roll back")
+            return EXIT_ERROR
+        if not numbers:
+            _warn(f"batch {batch} had no lessons to remove")
+            return EXIT_ERROR
+        removed = ", ".join(f"L{n}" for n in numbers)
+        _out(f"{PROG}: rolled back batch {batch} — removed {removed}")
+        return EXIT_OK
+
+    _warn(f"unknown learn action: {action}")
+    return EXIT_USAGE
 
 
 def _cmd_scope(args, config: config_mod.Config) -> int:
@@ -659,6 +767,10 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_theme(args)
     if args.command == "config":
         return _cmd_config(args, config, problems)
+    if args.command == "lessons":
+        return _cmd_lessons(args)
+    if args.command == "learn":
+        return _cmd_learn(args)
 
     parser.print_help()
     return EXIT_USAGE

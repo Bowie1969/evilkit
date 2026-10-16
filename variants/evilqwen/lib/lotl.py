@@ -1,6 +1,6 @@
 """Living off the land — attack operations using only tools already present on the target.
 
-Builds and executes shell commands using system utilities (nmap, ss, ip, ps, find,
+Builds and executes shell commands using system utilities (rustscan, ss, ip, ps, find,
 ssh, scp, curl, wget, nc, base64, cron, systemd) without dropping custom binaries.
 
 Usage:
@@ -159,33 +159,37 @@ def _now() -> str:
 # LOTL Recon
 # ---------------------------------------------------------------------------
 
-def _recon_nmap(host: str, scan_type: str, dry_run: bool) -> ReconStep:
-    """Port scan with nmap."""
+def _recon_rustscan(host: str, scan_type: str, dry_run: bool) -> ReconStep:
+    """Fast TCP port scan with rustscan.
+
+    rustscan is TCP-only, so the ``udp`` scan type still falls back to nmap,
+    which is the only tool here that can sweep UDP ports.
+    """
     if scan_type == "quick":
-        cmd = "nmap -T4 --top-ports 100 " + shlex.quote(host)
-    elif scan_type == "full":
-        cmd = "nmap -T4 -sV -sC -p- " + shlex.quote(host)
+        tool = "rustscan"
+        cmd = "rustscan -a " + shlex.quote(host) + " --top"
     elif scan_type == "udp":
+        tool = "nmap"
         cmd = "nmap -T4 -sU --top-ports 50 " + shlex.quote(host)
-    elif scan_type == "os":
-        cmd = "nmap -T4 -O " + shlex.quote(host)
     else:
-        cmd = "nmap -T4 -sV " + shlex.quote(host)
+        # full / os / default -> full TCP port sweep
+        tool = "rustscan"
+        cmd = "rustscan -a " + shlex.quote(host)
 
     if dry_run:
         return ReconStep(
-            tool="nmap",
+            tool=tool,
             command=cmd,
             status="dry_run",
             output="Would execute: " + cmd,
         )
 
-    if not _check_binary("nmap"):
-        return ReconStep(tool="nmap", command=cmd, status="not_found", error="nmap not found on target")
+    if not _check_binary(tool):
+        return ReconStep(tool=tool, command=cmd, status="not_found", error=f"{tool} not found on target")
 
     rc, out, err, ms = _run_cmd(cmd, timeout=120)
     status = "success" if rc == 0 else "failed"
-    return ReconStep(tool="nmap", command=cmd, status=status, output=out, error=err, duration_ms=ms)
+    return ReconStep(tool=tool, command=cmd, status=status, output=out, error=err, duration_ms=ms)
 
 
 def _recon_ss(host: str, dry_run: bool) -> ReconStep:
@@ -291,7 +295,7 @@ def _recon_cron(host: str, dry_run: bool) -> ReconStep:
 
 
 def lotl_recon(host: str, scan_type: str = "full", dry_run: bool = False) -> ReconReport:
-    """Use system tools (nmap, ss, ip, ps, find) to enumerate the target.
+    """Use system tools (rustscan, ss, ip, ps, find) to enumerate the target.
 
     Args:
         host: Target host identifier.
@@ -309,7 +313,7 @@ def lotl_recon(host: str, scan_type: str = "full", dry_run: bool = False) -> Rec
         lambda: _recon_ip(host, dry_run),
         lambda: _recon_ss(host, dry_run),
         lambda: _recon_ps(host, dry_run),
-        lambda: _recon_nmap(host, scan_type, dry_run),
+        lambda: _recon_rustscan(host, scan_type, dry_run),
         lambda: _recon_find(host, dry_run),
         lambda: _recon_cron(host, dry_run),
     ]

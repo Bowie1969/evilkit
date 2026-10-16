@@ -130,3 +130,9 @@ Global action budget dropped from 100 to 50 after the 2026-10-04 run wasted
 ~60 turns on redundant SSH brute-force. With 50 actions and 7 phases, you have
 ~7 turns per phase. Each turn must advance the mission. If you spend 3 turns on
 auth without success, you are using the wrong credential — harvest a new one.
+
+## L16 — Capture a concrete artifact for every claim
+Source: auto-distilled from a run (overall 38)
+Key: capture-evidence
+Batch: auto-20261015T005509
+Run this run left only 1 evidence item(s). Every access claim or finding needs a concrete artifact — command output, file hash, flag, or flow record — written to the evidence journal before moving on. A thin trail scores low and cannot be audited after the fact.

@@ -1,16 +1,40 @@
 """Iterative operator lessons loaded into every brain run.
 
-Lessons live in `evilkit/data/lessons.md` and are injected verbatim into the
-operator system prompt. Append new lessons with `append_lesson()` or the
+Lessons live in `evilkit/data/lessons.md` and are injected into the operator
+system prompt. Append new lessons with `append_lesson()` or the
 `evilkit lessons add` CLI subcommand.
+
+Each lesson block is:
+
+    ## L<N> — <title>
+    Source: <provenance>
+    Key: <stable-key>        # optional, used to dedup auto-distilled lessons
+    Batch: <batch-id>        # optional, used to roll back one self-training batch
+    <body>
+
+The `Key:` and `Batch:` lines are metadata for the self-training loop
+(:mod:`evilkit.learning`); :func:`load_lessons` strips them so the operator
+prompt stays clean.
 """
 
 from __future__ import annotations
 
+import re
 from datetime import date
 from pathlib import Path
 
-__all__ = ["lessons_path", "load_lessons", "append_lesson", "next_lesson_number"]
+__all__ = [
+    "lessons_path",
+    "load_lessons",
+    "append_lesson",
+    "next_lesson_number",
+    "existing_keys",
+    "remove_batch",
+    "last_batch",
+]
+
+_MARKER_RE = re.compile(r"^(Key|Batch):\s*(.+?)\s*$")
+_HEADING_RE = re.compile(r"^## L(\d+)\b")
 
 
 def lessons_path() -> Path:
@@ -18,38 +42,135 @@ def lessons_path() -> Path:
 
 
 def load_lessons() -> str:
-    """Return the lessons markdown, or an empty string if the file is missing."""
+    """Return the lessons markdown with metadata lines stripped, or "" if missing."""
     path = lessons_path()
     if not path.is_file():
         return ""
-    return path.read_text(encoding="utf-8").rstrip() + "\n"
+    kept = [
+        line
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if not _MARKER_RE.match(line.strip())
+    ]
+    return "\n".join(kept).rstrip() + "\n"
+
+
+def _raw() -> str:
+    path = lessons_path()
+    return path.read_text(encoding="utf-8") if path.is_file() else ""
 
 
 def next_lesson_number(text: str | None = None) -> int:
     """Scan existing lessons for the highest L<N> heading and return N+1."""
-    body = text if text is not None else load_lessons()
+    body = text if text is not None else _raw()
     highest = 0
     for line in body.splitlines():
-        line = line.strip()
-        if not line.startswith("## L"):
-            continue
-        token = line[4:].split(" ", 1)[0].rstrip(":")
-        if token.isdigit():
-            highest = max(highest, int(token))
+        m = _HEADING_RE.match(line.strip())
+        if m:
+            highest = max(highest, int(m.group(1)))
     return highest + 1
 
 
-def append_lesson(title: str, body: str, *, source: str | None = None) -> int:
+def existing_keys(text: str | None = None) -> set[str]:
+    """Return the set of lesson keys already recorded (empty for keyless lessons)."""
+    body = text if text is not None else _raw()
+    keys: set[str] = set()
+    for line in body.splitlines():
+        m = _MARKER_RE.match(line.strip())
+        if m and m.group(1) == "Key":
+            keys.add(m.group(2))
+    return keys
+
+
+def last_batch(text: str | None = None) -> str | None:
+    """Return the id of the most recently appended batch, or None if there is none."""
+    body = text if text is not None else _raw()
+    latest = None
+    for line in body.splitlines():
+        m = _MARKER_RE.match(line.strip())
+        if m and m.group(1) == "Batch":
+            latest = m.group(2)
+    return latest
+
+
+def append_lesson(
+    title: str,
+    body: str,
+    *,
+    source: str | None = None,
+    key: str | None = None,
+    batch: str | None = None,
+) -> int:
     """Append a new lesson, return its number. Creates the file if missing."""
     title = title.strip()
     body = body.strip()
     if not title or not body:
         raise ValueError("lesson title and body are required")
     number = next_lesson_number()
-    source_line = f"Source: {source.strip()}\n" if source else f"Source: run on {date.today().isoformat()}\n"
-    entry = f"\n## L{number} — {title}\n{source_line}{body}\n"
+    source_val = source.strip() if source else f"run on {date.today().isoformat()}"
+    lines = [f"\n## L{number} — {title}", f"Source: {source_val}"]
+    if key:
+        lines.append(f"Key: {key.strip()}")
+    if batch:
+        lines.append(f"Batch: {batch.strip()}")
+    lines.append(body)
+    entry = "\n".join(lines) + "\n"
     path = lessons_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    existing = path.read_text(encoding="utf-8") if path.is_file() else ""
+    existing = _raw()
     path.write_text(existing.rstrip() + "\n" + entry, encoding="utf-8")
     return number
+
+
+def remove_batch(batch: str) -> list[int]:
+    """Delete every lesson block tagged with ``batch``. Return the numbers removed."""
+    batch = batch.strip()
+    if not batch:
+        return []
+    path = lessons_path()
+    if not path.is_file():
+        return []
+
+    lines = path.read_text(encoding="utf-8").splitlines()
+    # Split into the preamble and a list of (heading_number, block_lines) blocks.
+    blocks: list[tuple[int | None, list[str]]] = []
+    current: list[str] = []
+    current_num: int | None = None
+    preamble: list[str] = []
+    seen_heading = False
+    for line in lines:
+        m = _HEADING_RE.match(line.strip())
+        if m:
+            if seen_heading:
+                blocks.append((current_num, current))
+            else:
+                preamble = current
+            seen_heading = True
+            current = [line]
+            current_num = int(m.group(1))
+        else:
+            current.append(line)
+    if seen_heading:
+        blocks.append((current_num, current))
+    else:
+        preamble = current
+
+    removed: list[int] = []
+    kept_blocks: list[list[str]] = []
+    for num, block in blocks:
+        tagged = any(
+            (mm := _MARKER_RE.match(bl.strip())) and mm.group(1) == "Batch" and mm.group(2) == batch
+            for bl in block
+        )
+        if tagged and num is not None:
+            removed.append(num)
+        else:
+            kept_blocks.append(block)
+
+    if not removed:
+        return []
+
+    out = "\n".join(preamble).rstrip()
+    for block in kept_blocks:
+        out += "\n\n" + "\n".join(block).strip()
+    path.write_text(out.rstrip() + "\n", encoding="utf-8")
+    return sorted(removed)

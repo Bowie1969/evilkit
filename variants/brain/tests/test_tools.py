@@ -46,7 +46,7 @@ class TestCommandValidation(EvilkitTestCase):
         validate_command("ping -c 1 127.0.0.1", ["127.0.0.1/32"])
 
     def test_in_scope_network_is_allowed(self):
-        validate_command("nmap 10.0.0.5", ["10.0.0.0/24"])
+        validate_command("rustscan -a 10.0.0.5", ["10.0.0.0/24"])
 
     def test_hostname_outside_scope_is_rejected(self):
         with self.assertRaises(ExecutionError):
@@ -71,11 +71,11 @@ class TestSimulationExecutor(EvilkitTestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("outside", result.stderr)
 
-    def test_nmap_loopback_returns_ports(self):
+    def test_rustscan_loopback_returns_ports(self):
         exe = SimulationExecutor(["127.0.0.1/32"])
-        result = exe.execute("nmap -sV 127.0.0.1")
+        result = exe.execute("rustscan -a 127.0.0.1")
         self.assertEqual(result.returncode, 0)
-        self.assertIn("22/tcp open", result.stdout)
+        self.assertIn("Open 127.0.0.1:22", result.stdout)
 
     def test_curl_loopback_returns_html(self):
         exe = SimulationExecutor(["127.0.0.1/32"])
@@ -102,8 +102,8 @@ class TestShellExecutor(EvilkitTestCase):
     def test_missing_binary_reports_not_found(self):
         exe = ShellExecutor(["127.0.0.1/32"])
         with mock.patch("evilkit.tools.subprocess.run") as run:
-            run.side_effect = FileNotFoundError(2, "No such file", "nmap")
-            result = exe.execute("nmap 127.0.0.1")
+            run.side_effect = FileNotFoundError(2, "No such file", "rustscan")
+            result = exe.execute("rustscan -a 127.0.0.1")
         self.assertEqual(result.returncode, 127)
         self.assertIn("command not found", result.stderr)
 

@@ -151,7 +151,7 @@ class TestControllerWithMockedModels(EvilkitTestCase):
             {"goal": "ping host", "command": "ping -c 1 127.0.0.1", "expected_result": "ok"},
         ])
         auditor = self._fixed_auditor([
-            {"verdict": "ADVISE", "reason": "try nmap instead"},
+            {"verdict": "ADVISE", "reason": "try rustscan instead"},
         ])
         executor = SimulationExecutor(["127.0.0.1/32"])
         controller = Controller(

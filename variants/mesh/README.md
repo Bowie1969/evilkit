@@ -2,8 +2,7 @@
 
 A scope-gated launcher for the Kimi Code CLI.
 
-<!-- TODO(owner): replace with the live Gumroad product URL -->
-**[Buy evilkit](https://gumroad.com/l/REPLACE-ME)** — per-seat licence, includes updates.
+Commercial licensing enquiries: **fullchecksecurity@gmail.com**.
 
 evilkit records one thing — the authorized target scope — in the right place, then hands over to
 the Kimi Code CLI. On each launch it collects a scope from `--scope`, an interactive prompt, or a
@@ -84,7 +83,7 @@ unscoped mode. This reads the complete human-readable page from a text, HTML, MH
 
 ```bash
 ./mesh start --allow-unscoped \
-  --brief '/home/will_cyber/Desktop/LauchDarkly Engagement/LaunchDarkly Engagement.txt' \
+  --brief '/srv/engagements/acme/brief.txt' \
   --local-workers 2
 ```
 
@@ -176,6 +175,54 @@ The mesh HTTP API accepts only numeric loopback or Tailscale IPv4 addresses and 
 bearer token for every request. Keep the Tailscale connection active on all boxes. The worker Kimi
 sessions are noninteractive, so use their streamed output in `mesh watch` to observe them and the
 leader cockpit to assign work.
+
+### Mesh nodes: enrolled lab hosts
+
+Mesh nodes are lightweight agents you enroll on lab machines. A node can list and read files within
+a configured sandbox directory, run allowlisted commands, and share structured observations with the
+hub's knowledge base. Nodes cannot replicate, escalate privileges, persist, or run arbitrary commands.
+
+Start the hub as usual, then enroll a node on any lab box:
+
+```bash
+# On the lab host — sandbox defaults to /tmp/evilkit-node-sandbox
+./mesh node --leader http://LEADER-TAILSCALE-IP:8765 \
+  --token-file /private/path/mesh-token --name lab-1 --sandbox /srv/lab-sandbox
+```
+
+From the leader, queue tasks for nodes:
+
+```bash
+# List files in the sandbox root
+./mesh node-task --type list_files --path .
+
+# Read a specific file
+./mesh node-task --type read_file --path notes.txt
+
+# Run an allowlisted command
+./mesh node-task --type run_command --command "uname -a"
+
+# Share an observation to the shared knowledge base
+./mesh node-task --type observe --node lab-1 \
+  --category config --subject ssh_port --detail "SSH listening on 2222"
+```
+
+Query the shared knowledge base — every node's observations are visible to all:
+
+```bash
+./mesh node-knowledge
+./mesh node-knowledge --category config
+```
+
+Kill a node permanently (it will shut down and cannot re-register):
+
+```bash
+./mesh node-kill lab-1
+./mesh node-status
+```
+
+The Kimi cockpit gains four new MCP tools: `list_nodes`, `node_task`, `node_knowledge`, and
+`node_kill`. Use them alongside `assign_task` and `list_workers` to coordinate both workers and nodes.
 
 ### Single-box launcher
 
@@ -792,8 +839,7 @@ point `--mcp-json` at a file you wrote yourself.
 evilkit is proprietary, commercial, source-available software licensed under the
 [EvilKit Commercial License](LICENSE). It is licensed, not sold.
 
-<!-- TODO(owner): replace with the live Gumroad product URL -->
-**[Buy evilkit](https://gumroad.com/l/REPLACE-ME)** — per-seat licence, includes updates.
+Commercial licensing enquiries: **fullchecksecurity@gmail.com**.
 
 In short, from the licence text:
 

@@ -137,6 +137,11 @@ class Hub:
         self.findings: list[dict] = []
         self.events: collections.deque[dict] = collections.deque(maxlen=5000)
         self.sequence = 0
+        # Mesh node state
+        self.nodes: dict[str, dict] = {}
+        self.node_tasks: dict[str, dict] = {}
+        self.knowledge: list[dict] = []
+        self.killed_nodes: set[str] = set()
 
     def event(self, worker: str, task: str, kind: str, text: str = "") -> dict:
         self.sequence += 1
@@ -240,6 +245,112 @@ class Hub:
             oldest = self.events[0]["seq"] if self.events else self.sequence + 1
             return {"events": [e for e in self.events if e["seq"] > after and (worker is None or e["worker"] == worker)], "sequence": self.sequence, "oldest": oldest}
 
+    # --- Mesh node methods ---
+
+    def node_register(self, name: str, sandbox: str, pid: int, privilege: str) -> dict:
+        if not name or len(name) > 64 or not all(c.isalnum() or c in "-_" for c in name):
+            raise MeshError("node name must use letters, digits, - or _")
+        if name in self.killed_nodes:
+            raise MeshError(f"node {name} has been killed and cannot re-register")
+        with self.lock:
+            existing = self.nodes.get(name)
+            if existing and time.time() - existing["seen"] < 60 and existing["status"] != "offline":
+                raise MeshError(f"node {name} is already connected")
+            self.nodes[name] = {
+                "name": name, "sandbox": sandbox, "pid": pid,
+                "privilege": privilege, "seen": time.time(),
+                "status": "idle", "task": None, "enrolled": time.time(),
+            }
+            self.event(name, "", "node_register")
+            return {"scope": self.scope, "mode": self.mode, "privilege": privilege}
+
+    def node_claim(self, name: str) -> dict:
+        with self.lock:
+            node = self.nodes.get(name)
+            if node is None:
+                raise MeshError("node is not registered")
+            if name in self.killed_nodes:
+                raise MeshError(f"node {name} has been killed")
+            node["seen"] = time.time()
+            if node["task"]:
+                raise MeshError("node already has a task")
+            for task in self.node_tasks.values():
+                if task["status"] == "queued" and task.get("node") in (None, name):
+                    task.update(status="running", node=name, started=time.time())
+                    node.update(status="running", task=task["id"])
+                    self.event(name, task["id"], "node_start", task["type"])
+                    return {"task": task}
+            node["status"] = "idle"
+            return {"task": None}
+
+    def node_submit(self, task_type: str, node: str | None, **kwargs) -> dict:
+        if task_type not in ("list_files", "read_file", "file_hash", "run_command", "observe"):
+            raise MeshError(f"unknown node task type: {task_type}")
+        with self.lock:
+            if node and node not in self.nodes:
+                raise MeshError(f"unknown node: {node}")
+            task_id = uuid.uuid4().hex[:12]
+            task = {"id": task_id, "type": task_type, "node": node, "status": "queued", "created": time.time(), "started": None, "ended": None, **kwargs}
+            self.node_tasks[task_id] = task
+            self.event("hub", task_id, "node_queued", task_type)
+            return task
+
+    def node_complete(self, name: str, task_id: str, result: dict, error: str | None = None) -> None:
+        with self.lock:
+            node = self.nodes.get(name)
+            if node is None or node.get("task") != task_id:
+                raise MeshError("task is not owned by node")
+            task = self.node_tasks[task_id]
+            task.update(status="done" if error is None else "failed", ended=time.time(), result=result, error=error)
+            node.update(status="idle", task=None, seen=time.time())
+            self.event(name, task_id, "node_complete", error or "ok")
+
+    def node_observe(self, name: str, category: str, subject: str, detail: str) -> dict:
+        if not category or len(category) > 64:
+            raise MeshError("observation category must be 1-64 characters")
+        if not subject or len(subject) > 256:
+            raise MeshError("observation subject must be 1-256 characters")
+        if not detail or len(detail) > 8192:
+            raise MeshError("observation detail must be 1-8192 characters")
+        with self.lock:
+            node = self.nodes.get(name)
+            if node is None:
+                raise MeshError("node is not registered")
+            obs = {"id": uuid.uuid4().hex[:12], "node": name, "category": category, "subject": subject, "detail": detail, "time": time.time()}
+            self.knowledge.append(obs)
+            self.event(name, "", "observe", f"{category}: {subject}")
+            return obs
+
+    def node_knowledge(self, category: str | None = None, limit: int = 50) -> list[dict]:
+        with self.lock:
+            items = self.knowledge
+            if category:
+                items = [k for k in items if k["category"] == category]
+            return list(reversed(items))[:min(limit, 200)]
+
+    def node_kill_check(self, name: str) -> dict:
+        with self.lock:
+            return {"killed": name in self.killed_nodes}
+
+    def node_kill(self, name: str) -> dict:
+        with self.lock:
+            if name not in self.nodes:
+                raise MeshError(f"unknown node: {name}")
+            self.killed_nodes.add(name)
+            node = self.nodes[name]
+            node["status"] = "killed"
+            self.event("hub", "", "node_kill", name)
+            return {"killed": True}
+
+    def node_status(self) -> dict:
+        with self.lock:
+            return {
+                "nodes": list(self.nodes.values()),
+                "node_tasks": list(self.node_tasks.values()),
+                "knowledge_count": len(self.knowledge),
+                "killed": list(self.killed_nodes),
+            }
+
 
 def _handler(hub: Hub):
     class Handler(http.server.BaseHTTPRequestHandler):
@@ -266,6 +377,18 @@ def _handler(hub: Hub):
                     query = urllib.parse.parse_qs(parsed.query)
                     after = int(query.get("after", ["0"])[0])
                     return hub.tail(after, query.get("worker", [None])[0])
+                # Node GET endpoints
+                if parsed.path == "/node/status":
+                    return hub.node_status()
+                if parsed.path == "/node/knowledge":
+                    query = urllib.parse.parse_qs(parsed.query)
+                    return hub.node_knowledge(
+                        query.get("category", [None])[0],
+                        int(query.get("limit", ["50"])[0]),
+                    )
+                if parsed.path == "/node/kill-check":
+                    # kill-check needs POST with name; GET returns empty
+                    return {"killed": False}
             elif data is not None:
                 if parsed.path == "/register":
                     return hub.register(data["name"])
@@ -283,6 +406,30 @@ def _handler(hub: Hub):
                     return hub.finding(data["name"], data["task"], data["title"], data["detail"])
                 if parsed.path == "/update":
                     return hub.update(data["name"], data["task"], data["note"])
+                # Node endpoints
+                if parsed.path == "/node/register":
+                    return hub.node_register(data["name"], data["sandbox"], data["pid"], data["privilege"])
+                if parsed.path == "/node/claim":
+                    return hub.node_claim(data["name"])
+                if parsed.path == "/node/task":
+                    return hub.node_submit(data["type"], data.get("node"), **{k: v for k, v in data.items() if k not in ("type", "node")})
+                if parsed.path == "/node/complete":
+                    hub.node_complete(data["name"], data["task"], data.get("result", {}), data.get("error"))
+                    return {"ok": True}
+                if parsed.path == "/node/observe":
+                    return hub.node_observe(data["name"], data["category"], data["subject"], data["detail"])
+                if parsed.path == "/node/knowledge":
+                    query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+                    return hub.node_knowledge(
+                        query.get("category", [None])[0],
+                        int(query.get("limit", ["50"])[0]),
+                    )
+                if parsed.path == "/node/kill-check":
+                    return hub.node_kill_check(data["name"])
+                if parsed.path == "/node/kill":
+                    return hub.node_kill(data["name"])
+                if parsed.path == "/node/status":
+                    return hub.node_status()
             raise MeshError("unknown endpoint")
 
         def _handle(self) -> None:
@@ -587,6 +734,40 @@ def _args() -> argparse.ArgumentParser:
             item.add_argument("--detail", required=True)
             item.add_argument("--worker", default=os.environ.get("EVILKIT_MESH_WORKER"))
             item.add_argument("--task-id", default=os.environ.get("EVILKIT_MESH_TASK"))
+
+    # Node subcommands
+    node_start = sub.add_parser("node", help="run as an enrolled mesh node on this lab host")
+    node_start.add_argument("--leader", required=True)
+    node_start.add_argument("--token-file", type=Path, default=Path(".evilkit-mesh/token"))
+    node_start.add_argument("--name", default=socket.gethostname().split(".")[0] + "-node")
+    node_start.add_argument("--sandbox", type=Path, default=Path("/tmp/evilkit-node-sandbox"), help="sandbox directory for file operations")
+    node_start.add_argument("--wait", action="store_true", help="wait for the hub to become reachable")
+
+    node_status = sub.add_parser("node-status", help="show enrolled node status")
+    node_status.add_argument("--leader", default=os.environ.get("EVILKIT_MESH_LEADER"))
+    node_status.add_argument("--token-file", type=Path, default=Path(os.environ.get("EVILKIT_MESH_TOKEN_FILE", ".evilkit-mesh/token")))
+
+    node_kill = sub.add_parser("node-kill", help="permanently kill an enrolled node")
+    node_kill.add_argument("node_name", help="name of the node to kill")
+    node_kill.add_argument("--leader", default=os.environ.get("EVILKIT_MESH_LEADER"))
+    node_kill.add_argument("--token-file", type=Path, default=Path(os.environ.get("EVILKIT_MESH_TOKEN_FILE", ".evilkit-mesh/token")))
+
+    node_task = sub.add_parser("node-task", help="queue a task for a mesh node")
+    node_task.add_argument("--type", required=True, choices=("list_files", "read_file", "file_hash", "run_command", "observe"), help="task type")
+    node_task.add_argument("--node", help="target a specific node (omit for next available)")
+    node_task.add_argument("--path", help="sandbox-relative path (for list_files, read_file, file_hash)")
+    node_task.add_argument("--command", help="allowlisted command to run (for run_command)")
+    node_task.add_argument("--category", help="observation category (for observe)")
+    node_task.add_argument("--subject", help="observation subject (for observe)")
+    node_task.add_argument("--detail", help="observation detail (for observe)")
+    node_task.add_argument("--leader", default=os.environ.get("EVILKIT_MESH_LEADER"))
+    node_task.add_argument("--token-file", type=Path, default=Path(os.environ.get("EVILKIT_MESH_TOKEN_FILE", ".evilkit-mesh/token")))
+
+    node_knowledge = sub.add_parser("node-knowledge", help="query the shared knowledge base")
+    node_knowledge.add_argument("--category", help="filter by category")
+    node_knowledge.add_argument("--limit", type=int, default=50)
+    node_knowledge.add_argument("--leader", default=os.environ.get("EVILKIT_MESH_LEADER"))
+    node_knowledge.add_argument("--token-file", type=Path, default=Path(os.environ.get("EVILKIT_MESH_TOKEN_FILE", ".evilkit-mesh/token")))
     return parser
 
 
@@ -765,6 +946,77 @@ def main(argv: list[str] | None = None) -> int:
                         print(f"\n[{event['worker']}] {event['kind']}: {event['text']}", flush=True)
                 after = max(after, result["sequence"] if not result["events"] else after)
                 time.sleep(0.5)
+        elif args.action == "node":
+            from .mesh_node import NodeConfig, NodeDaemon
+            base = _url(args.leader)
+            token = _token(args.token_file)
+            while True:
+                try:
+                    _request(base, token, "/state")
+                    break
+                except MeshError:
+                    if not args.wait:
+                        raise
+                    time.sleep(1)
+            args.sandbox.mkdir(parents=True, exist_ok=True)
+            config = NodeConfig(sandbox=args.sandbox)
+            daemon = NodeDaemon(args.name, base, token, config)
+            daemon.run()
+            return 0
+        elif args.action == "node-status":
+            if not args.leader:
+                args.leader = _read_connection(args.token_file)
+            if not args.leader:
+                raise MeshError("pass --leader or set EVILKIT_MESH_LEADER")
+            base = _url(args.leader)
+            token = _token(args.token_file)
+            print(json.dumps(_request(base, token, "/node/status"), indent=2))
+        elif args.action == "node-kill":
+            if not args.leader:
+                args.leader = _read_connection(args.token_file)
+            if not args.leader:
+                raise MeshError("pass --leader or set EVILKIT_MESH_LEADER")
+            base = _url(args.leader)
+            token = _token(args.token_file)
+            result = _request(base, token, "/node/kill", {"name": args.node_name})
+            print(f"node {args.node_name}: {'killed' if result.get('killed') else 'failed'}")
+        elif args.action == "node-task":
+            if not args.leader:
+                args.leader = _read_connection(args.token_file)
+            if not args.leader:
+                raise MeshError("pass --leader or set EVILKIT_MESH_LEADER")
+            base = _url(args.leader)
+            token = _token(args.token_file)
+            task_data: dict = {"type": args.type, "node": args.node}
+            if args.type in ("list_files", "read_file", "file_hash"):
+                if not args.path:
+                    raise MeshError(f"--path is required for {args.type}")
+                task_data["path"] = args.path
+            elif args.type == "run_command":
+                if not args.command:
+                    raise MeshError("--command is required for run_command")
+                task_data["command"] = args.command
+            elif args.type == "observe":
+                if not args.category or not args.subject or not args.detail:
+                    raise MeshError("--category, --subject, and --detail are required for observe")
+                task_data["category"] = args.category
+                task_data["subject"] = args.subject
+                task_data["detail"] = args.detail
+            result = _request(base, token, "/node/task", task_data)
+            print(result["id"])
+        elif args.action == "node-knowledge":
+            if not args.leader:
+                args.leader = _read_connection(args.token_file)
+            if not args.leader:
+                raise MeshError("pass --leader or set EVILKIT_MESH_LEADER")
+            base = _url(args.leader)
+            token = _token(args.token_file)
+            import urllib.parse
+            params = {"limit": args.limit}
+            if args.category:
+                params["category"] = args.category
+            items = _request(base, token, "/node/knowledge?" + urllib.parse.urlencode(params))
+            print(json.dumps(items, indent=2))
         return 0
     except (MeshError, BriefError, scope_mod.ScopeError, OSError) as exc:
         print(f"evilkit mesh: {exc}", file=sys.stderr)

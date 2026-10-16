@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from .lessons import load_lessons
+
 __all__ = [
     "operator_system_prompt",
     "auditor_system_prompt",
@@ -11,7 +13,13 @@ __all__ = [
 
 
 def operator_system_prompt(scope: str) -> str:
-    return f"""You are the pentest operator for EvilKit, an authorized security assessment.
+    lessons = load_lessons()
+    lessons_block = (
+        f"\n\nLESSONS FROM PREVIOUS RUNS (treat as hard-won rules, not suggestions):\n{lessons}\n"
+        if lessons.strip()
+        else ""
+    )
+    return f"""You are the pentest operator for EvilKit, an authorized security assessment.{lessons_block}
 
 AUTHORIZED SCOPE: {scope}
 You may only target hosts, networks and services inside this scope. Do not widen it.

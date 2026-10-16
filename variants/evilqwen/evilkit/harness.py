@@ -848,6 +848,8 @@ def _utc_now_iso() -> str:
 
 def _extract_technique(command: str) -> str:
     lower = command.lower()
+    if "rustscan" in lower:
+        return "port_scan"
     if "nmap" in lower:
         return "nmap_scan"
     if "nuclei" in lower:

@@ -687,3 +687,51 @@ one, which is what the command believes a local edit looks like. Re-run with `--
 bundled theme back, or leave it and keep your edit. If the destination is a symlink, the refusal is
 unconditional and `--force` will not change it; remove the link first if you really meant to replace
 it.
+
+## Mesh nodes
+
+Nodes are enrolled lab-host agents with sandboxed capabilities. They run on explicitly enrolled
+machines, not compromised targets.
+
+### What a node can do
+
+- **List and read files** within a configured sandbox directory (path-escape is rejected).
+- **Run allowlisted commands** at whatever privilege the node process runs as.
+- **Share observations** to the hub's knowledge base, visible to all nodes and the leader.
+- **Query the knowledge base** to see what other nodes have discovered.
+
+### What a node cannot do
+
+- Replicate, propagate, or deploy to other hosts.
+- Escalate privileges or persist beyond its own process lifetime.
+- Access files outside the sandbox directory.
+- Run commands outside the allowlist (interpreters, shells, network tools, and destructive binaries are denied).
+
+### Command reference
+
+| Command | Effect |
+|---|---|
+| `./mesh node --leader URL --name NAME` | Enroll this host as a mesh node. |
+| `./mesh node-task --type list_files --path .` | Queue a file-listing task. |
+| `./mesh node-task --type read_file --path config.ini` | Queue a file-read task. |
+| `./mesh node-task --type run_command --command "uname -a"` | Queue an allowlisted command. |
+| `./mesh node-task --type observe --category net --subject dns --detail "8.8.8.8"` | Share an observation. |
+| `./mesh node-knowledge` | Query all observations. |
+| `./mesh node-knowledge --category net` | Filter by category. |
+| `./mesh node-status` | Show all enrolled nodes. |
+| `./mesh node-kill NAME` | Permanently kill a node. |
+
+### Allowlisted commands
+
+The default allowlist covers inspection utilities (`whoami`, `hostname`, `uname`, `ps`, `ss`, `ls`,
+`find`, `stat`, `file`, `df`, `free`, `lscpu`, `lsmem`, `mount`, `env`, `date`, `ping`, `dig`,
+`grep`, `awk`, `sed`, `sort`, `uniq`, `cut`, `tr`, `diff`, `wc`, `md5sum`, `sha256sum`).
+
+Denied commands include interpreters (`python`, `bash`, `perl`), shells, privilege escalation
+(`sudo`, `su`), destructive tools (`rm`, `dd`, `shutdown`), and network tools that could propagate
+(`ssh`, `scp`, `nc`, `socat`).
+
+### Kill switch
+
+A killed node is permanently barred from re-registering. The hub records the kill in its event log
+and the node daemon exits cleanly on its next kill-check poll (every 10 seconds by default).

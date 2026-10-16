@@ -1,7 +1,6 @@
 # evilkit pricing and licensing
 
-<!-- TODO(owner): replace with the live Gumroad product URL -->
-**[Buy evilkit](https://gumroad.com/l/REPLACE-ME)** — per-seat licence, includes updates.
+Commercial licensing enquiries: **fullchecksecurity@gmail.com**.
 
 evilkit is paid, proprietary software. It is licensed, not sold. The binding terms are in
 [`LICENSE`](../LICENSE) at the root of the repository; this page is a summary of how the product is

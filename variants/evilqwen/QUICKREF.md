@@ -40,6 +40,19 @@ Created 2026-10-04
    - `mission_status` → Objective states, missing witnesses, budget
    - `mission_verify` → Record one witness that proves part of an outcome
 
+## REA teaching range
+
+Synthetic loopback-only estate that emulates REA's published control-plane shape
+(SAML→SSH-CA trust, KMS envelope secrets, SSH-key-wrapped IAM keys, stack
+manifests). One tool, `rea_range`, with actions `prepare | start | stop | status |
+mission | score` — `mission` returns the briefing, `score` reads only the estate's
+`evidence.jsonl` journal and writes proven witnesses into the mission tracker
+(contract `contracts/rea-mission.json`, campaign `rea-control-plane`).
+
+One-line teaching path: map (DNS TXT + object store) → `/sso` with the planted
+credential → `/cert` → read `ca_key` → KMS `/unwrap` → shush `/exec` → `cat
+flag.txt` on prod-api. See `lab-docs/rea-shape.md`.
+
 ## Lab Topology
 
 ```

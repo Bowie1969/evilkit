@@ -23,92 +23,17 @@ import sys
 import time
 import unittest
 
+from tests._helpers import McpWireHarness
+
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SERVER = os.path.join(REPO_ROOT, "mcp-malware-generator.py")
 
 
-class McpServerCase(unittest.TestCase):
-    def setUp(self):
-        self._procs = []
+class McpServerCase(McpWireHarness, unittest.TestCase):
+    """Drive the real server over stdio, one spawned server per test."""
 
-    def tearDown(self):
-        for proc in self._procs:
-            if proc.poll() is None:
-                proc.kill()
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    pass
-
-    def _spawn(self, extra_env=None, budget=None, max_scan_hosts=None):
-        env = dict(os.environ)
-        for key in ("LAB_SSH_USER", "LAB_SSH_PASS", "LAB_SSH_KEY"):
-            env.pop(key, None)
-        env.pop("EVILKIT_MISSION_CONTRACT", None)
-        env.pop("EVILKIT_MISSION_STATE", None)
-        if budget is not None:
-            env["EVILKIT_MCP_CALL_BUDGET"] = str(budget)
-        if max_scan_hosts is not None:
-            env["EVILKIT_MCP_MAX_SCAN_HOSTS"] = str(max_scan_hosts)
-        env.update(extra_env or {})
-        proc = subprocess.Popen(
-            [sys.executable, SERVER],
-            cwd=REPO_ROOT,
-            env=env,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        self._procs.append(proc)
-        return proc
-
-    def _rpc(self, proc, method, params=None, req_id=0, timeout=15.0):
-        """Send one request; return (status, elapsed, response_dict).
-
-        status is 'ok', 'garbage-line' (non-JSON byte on the wire — the
-        run-12 poison), 'timeout', or 'child-exited'.
-        """
-        msg = {"jsonrpc": "2.0", "id": req_id, "method": method}
-        if params is not None:
-            msg["params"] = params
-        if proc.poll() is not None:
-            return ("child-exited", 0.0, None)
-        proc.stdin.write(json.dumps(msg) + "\n")
-        proc.stdin.flush()
-        t0 = time.time()
-        sel = selectors.DefaultSelector()
-        sel.register(proc.stdout, selectors.EVENT_READ)
-        while True:
-            if proc.poll() is not None:
-                return ("child-exited", time.time() - t0, None)
-            remaining = timeout - (time.time() - t0)
-            if remaining <= 0:
-                return ("timeout", timeout, None)
-            events = sel.select(timeout=min(0.25, remaining))
-            if not events:
-                continue
-            line = proc.stdout.readline()
-            if not line:
-                return ("child-exited", time.time() - t0, None)
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                resp = json.loads(line)
-            except json.JSONDecodeError:
-                return ("garbage-line", time.time() - t0, line[:200])
-            if resp.get("id") == req_id:
-                return ("ok", time.time() - t0, resp)
-
-    def _init(self, proc):
-        status, _, resp = self._rpc(proc, "initialize", {
-            "protocolVersion": "2025-06-18",
-            "capabilities": {},
-            "clientInfo": {"name": "test", "version": "0"},
-        }, req_id=1)
-        self.assertEqual(status, "ok", "initialize failed")
-        self._rpc(proc, "notifications/initialized", req_id=2)
+    SERVER_PATH = SERVER
+    SERVER_CWD = REPO_ROOT
 
     def test_wire_stays_json_across_tool_battery(self):
         """No tool may put a non-JSON-RPC byte on stdout (run-12 poison)."""

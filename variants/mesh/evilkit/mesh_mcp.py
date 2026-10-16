@@ -46,6 +46,27 @@ TOOLS = [
         "description": "Record a worker progress update for its current task.",
         "inputSchema": {"type": "object", "properties": {"note": {"type": "string"}}, "required": ["note"]},
     },
+    # --- Node tools ---
+    {
+        "name": "list_nodes",
+        "description": "Show enrolled mesh node status, tasks, and knowledge base summary.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "node_task",
+        "description": "Queue a task for a mesh node: list_files, read_file, file_hash, run_command, or observe.",
+        "inputSchema": {"type": "object", "properties": {"type": {"type": "string", "enum": ["list_files", "read_file", "file_hash", "run_command", "observe"]}, "node": {"type": "string"}, "path": {"type": "string"}, "command": {"type": "string"}, "category": {"type": "string"}, "subject": {"type": "string"}, "detail": {"type": "string"}}, "required": ["type"]},
+    },
+    {
+        "name": "node_knowledge",
+        "description": "Query the shared knowledge base of observations from all nodes.",
+        "inputSchema": {"type": "object", "properties": {"category": {"type": "string"}, "limit": {"type": "integer"}}},
+    },
+    {
+        "name": "node_kill",
+        "description": "Permanently kill an enrolled mesh node. It will shut down and cannot re-register.",
+        "inputSchema": {"type": "object", "properties": {"node_name": {"type": "string"}}, "required": ["node_name"]},
+    },
 ]
 
 
@@ -81,6 +102,36 @@ def _call(name: str, args: dict) -> object:
         if not worker or not task:
             raise MeshError("only an active worker can update a task")
         return _request(base, token, "/update", {"name": worker, "task": task, "note": args["note"]})
+    # Node tools
+    if name == "list_nodes":
+        return _request(base, token, "/node/status")
+    if name == "node_task":
+        task_type = args["type"]
+        task_data: dict = {"type": task_type}
+        if args.get("node"):
+            task_data["node"] = args["node"]
+        if task_type in ("list_files", "read_file", "file_hash"):
+            if not args.get("path"):
+                raise MeshError(f"path is required for {task_type}")
+            task_data["path"] = args["path"]
+        elif task_type == "run_command":
+            if not args.get("command"):
+                raise MeshError("command is required for run_command")
+            task_data["command"] = args["command"]
+        elif task_type == "observe":
+            for key in ("category", "subject", "detail"):
+                if not args.get(key):
+                    raise MeshError(f"{key} is required for observe")
+                task_data[key] = args[key]
+        return _request(base, token, "/node/task", task_data)
+    if name == "node_knowledge":
+        import urllib.parse
+        params = {"limit": min(args.get("limit", 50), 200)}
+        if args.get("category"):
+            params["category"] = args["category"]
+        return _request(base, token, "/node/knowledge?" + urllib.parse.urlencode(params))
+    if name == "node_kill":
+        return _request(base, token, "/node/kill", {"name": args["node_name"]})
     raise MeshError(f"unknown tool: {name}")
 
 

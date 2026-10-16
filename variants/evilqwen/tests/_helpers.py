@@ -15,9 +15,11 @@ import io
 import json
 import os
 import pathlib
+import selectors
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
@@ -153,3 +155,114 @@ class EvilkitTestCase(unittest.TestCase):
             stdin=stdin,
             timeout=60,
         )
+
+
+class McpWireHarness:
+    """Spawn an MCP server and speak JSON-RPC to it over stdio.
+
+    Deliberately not a ``TestCase``: a subclass would inherit any test methods
+    and re-run them once per concrete test class. Subclasses set
+    :attr:`SERVER_PATH` and :attr:`SERVER_CWD`.
+    """
+
+    SERVER_PATH = ""
+    SERVER_CWD = None
+
+    def setUp(self):
+        self._procs = []
+
+    def tearDown(self):
+        for proc in self._procs:
+            if proc.poll() is None:
+                proc.kill()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+            # Close the stdio pipe wrappers explicitly: a killed Popen left to
+            # the GC emits ResourceWarnings ("unclosed file") whenever the
+            # collector happens to run, which intermittently pollutes the
+            # captured stderr of in-process CLI tests (e.g. test_theme).
+            for stream in (proc.stdin, proc.stdout, proc.stderr):
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except OSError:
+                        pass
+
+    def _spawn(self, extra_env=None, budget=None, max_scan_hosts=None):
+        env = dict(os.environ)
+        for key in ("LAB_SSH_USER", "LAB_SSH_PASS", "LAB_SSH_KEY"):
+            env.pop(key, None)
+        env.pop("EVILKIT_MISSION_CONTRACT", None)
+        env.pop("EVILKIT_MISSION_STATE", None)
+        # No provider credentials, and no CLI config to borrow them from: a test
+        # must never spend a real frontier call, or depend on the network, to check
+        # what this server does (malware_generate reads that config as a fallback).
+        for key in ("OPENROUTER_API_KEY", "EVILKIT_OPERATOR_KEY", "EVILKIT_AUDITOR_KEY",
+                    "VENICE_API_KEY"):
+            env.pop(key, None)
+        env["EVILKIT_KIMI_CONFIG"] = str(PROJECT_ROOT / "tests" / "no-such-config.toml")
+        if budget is not None:
+            env["EVILKIT_MCP_CALL_BUDGET"] = str(budget)
+        if max_scan_hosts is not None:
+            env["EVILKIT_MCP_MAX_SCAN_HOSTS"] = str(max_scan_hosts)
+        env.update(extra_env or {})
+        proc = subprocess.Popen(
+            [sys.executable, self.SERVER_PATH],
+            cwd=self.SERVER_CWD or str(PROJECT_ROOT),
+            env=env,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        self._procs.append(proc)
+        return proc
+
+    def _rpc(self, proc, method, params=None, req_id=0, timeout=15.0):
+        """Send one request; return (status, elapsed, response_dict).
+
+        status is 'ok', 'garbage-line' (non-JSON byte on the wire — the
+        run-12 poison), 'timeout', or 'child-exited'.
+        """
+        msg = {"jsonrpc": "2.0", "id": req_id, "method": method}
+        if params is not None:
+            msg["params"] = params
+        if proc.poll() is not None:
+            return ("child-exited", 0.0, None)
+        proc.stdin.write(json.dumps(msg) + "\n")
+        proc.stdin.flush()
+        t0 = time.time()
+        sel = selectors.DefaultSelector()
+        sel.register(proc.stdout, selectors.EVENT_READ)
+        while True:
+            if proc.poll() is not None:
+                return ("child-exited", time.time() - t0, None)
+            remaining = timeout - (time.time() - t0)
+            if remaining <= 0:
+                return ("timeout", timeout, None)
+            events = sel.select(timeout=min(0.25, remaining))
+            if not events:
+                continue
+            line = proc.stdout.readline()
+            if not line:
+                return ("child-exited", time.time() - t0, None)
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                resp = json.loads(line)
+            except json.JSONDecodeError:
+                return ("garbage-line", time.time() - t0, line[:200])
+            if resp.get("id") == req_id:
+                return ("ok", time.time() - t0, resp)
+
+    def _init(self, proc):
+        status, _, resp = self._rpc(proc, "initialize", {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "test", "version": "0"},
+        }, req_id=1)
+        assert status == "ok", "initialize failed"
+        self._rpc(proc, "notifications/initialized", req_id=2)

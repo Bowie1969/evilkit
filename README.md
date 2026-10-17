@@ -196,6 +196,7 @@ positional arguments:
   COMMAND
     run          set the scope and launch the Kimi Code CLI (default)
     osint        run the passive OSINT stage; never launches anything
+    research     passive vuln research (NVD / Exploit-DB); never launches
     scope        inspect or change the recorded scope
     log          list the launches recorded locally
     watch        watch the recorded scope and alarm if it changes
@@ -215,6 +216,7 @@ examples:
   evilkit -s solo                    accept the locked-down default
   evilkit run --osint example.com    passive OSINT first, then pick the scope
   evilkit osint example.com          passive recon only; never launches
+  evilkit research CVE-2021-44228    passive vuln research; never launches
   evilkit --no-write -- -c           leave .mcp.json alone, resume a session
   evilkit scope show                 print the scope recorded in .mcp.json
   evilkit scope add 10.0.0.0/24      widen the record by one network
@@ -342,6 +344,74 @@ The optional `--attach` is the way to give a Kimi session the recon tools withou
 backed up, idempotent) and records nothing else — the scope stays exactly as it was, and nothing
 launches. Attach once per engagement; every later `evilkit run` or plain kimi launch in that
 directory carries the tools.
+
+### `evilkit research`
+
+Passive vulnerability research only. Scrapes public vulnerability-intelligence sources on the
+fly — NVD, Exploit-DB, and (with `research_scrape`) any public web page the operator names —
+prints the findings and writes `research-findings.json` in the working directory. It records
+nothing anywhere else and never launches a session, and it never probes the authorised target.
+
+```console
+$ evilkit research --help
+usage: evilkit research [-h] [--only TOOLS] [--skip TOOLS] [--json PATH]
+                        [--attach] QUERY [QUERY ...]
+
+Passive vuln research: scrape public NVD / Exploit-DB and public pages only.
+Prints findings and writes research-findings.json; nothing is probed and
+nothing launches.
+
+positional arguments:
+  QUERY         a CVE id, a product/version string, or a public http(s) URL
+
+options:
+  -h, --help    show this help message and exit
+  --only TOOLS  comma-separated subset of tools to run
+  --skip TOOLS  comma-separated tools to drop
+  --json PATH   write findings to PATH (default: research-findings.json here)
+  --attach      also write the research MCP server into the engagement
+                .mcp.json, so the next kimi session here can scrape vuln
+                intel mid-run (never launches)
+```
+
+```console
+$ evilkit research CVE-2021-44228
+evilkit: research research_cve CVE-2021-44228 ...
+evilkit: research research_cve CVE-2021-44228: ok
+
+CVE       : CVE-2021-44228
+Severity  : CRITICAL  (CVSS 3.1 10.0)
+Vector    : CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H
+  JNDI lookup in Apache Log4j allows remote code execution...
+
+1 source(s), 0 error(s)
+evilkit: findings -> research-findings.json
+```
+
+The query is classified automatically: a `CVE-...` id runs `research_cve` (the NVD record, with
+CVSS score/vector, weaknesses, CPEs and references); a product or version string runs
+`research_search` (NVD keyword search) *and* `research_exploits` (local searchsploit, then the
+Exploit-DB site); an `http(s)://` URL runs `research_scrape` and returns the page's title, text,
+links, headings and forms.
+
+Two properties hold by construction. The stage is **passive**: every request goes to public
+vulnerability-intelligence infrastructure, never to the authorised target. And it is
+**SSRF-guarded**: a URL is fetched only after its hostname resolves to a globally routable
+address, and the same check runs on every redirect, so loopback, RFC1918, link-local and the
+cloud metadata service (`169.254.169.254`) are refused before any bytes are sent.
+
+The `--attach` flag writes a `mcpServers.research` entry — `python -m evilkit.research` — into the
+engagement `.mcp.json` (additive, backed up, idempotent), so the next Kimi session in that
+directory carries the same four tools and can scrape vuln intel mid-run. The MCP server ships with
+evilkit, unlike the external osint server, so no separate installation is needed. Configuration
+lives in the `[research]` table:
+
+```toml
+[research]
+nvd_api_key = ""   # optional; NVD_API_KEY env wins. Raises the NVD rate limit.
+timeout_each = 30
+max_bytes = 1048576
+```
 
 ### `evilkit scope`
 

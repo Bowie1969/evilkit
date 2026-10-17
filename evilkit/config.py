@@ -16,7 +16,15 @@ from pathlib import Path
 from .mcpscope import SCOPE_ENV_KEY
 from .scope import SOLO_SCOPE, ScopeError, normalise_scope
 
-__all__ = ["Config", "OsintConfig", "config_dir", "config_path", "load", "save"]
+__all__ = [
+    "Config",
+    "OsintConfig",
+    "ResearchConfig",
+    "config_dir",
+    "config_path",
+    "load",
+    "save",
+]
 
 APP_NAME = "evilkit"
 
@@ -80,6 +88,25 @@ class OsintConfig:
 
 
 @dataclass
+class ResearchConfig:
+    """:mod:`evilkit.research` settings — the passive web-scraping stage.
+
+    The scraper ships with evilkit (no external server to point at), so only
+    the knobs that change behaviour live here. ``nvd_api_key`` is optional:
+    NVD works without one at a lower rate limit. An ``NVD_API_KEY`` in the
+    environment wins over this value, because a key belongs in the process
+    environment, not in a config file that may be shared.
+    """
+
+    nvd_api_key: str = ""
+    timeout_each: float = 30.0
+    max_bytes: int = 1_048_576
+
+    def resolved_api_key(self) -> str:
+        return os.environ.get("NVD_API_KEY") or self.nvd_api_key or ""
+
+
+@dataclass
 class Config:
     """Resolved settings, with every field defaulted to something safe."""
 
@@ -91,6 +118,7 @@ class Config:
     audit_path: str = ""
     extra_env: dict[str, str] = field(default_factory=dict)
     osint: OsintConfig = field(default_factory=OsintConfig)
+    research: ResearchConfig = field(default_factory=ResearchConfig)
 
     #: Populated by :func:`load` so callers can report where settings came from.
     source: Path | None = None
@@ -139,6 +167,33 @@ def _coerce_osint(raw: dict, problems: list[str]) -> dict:
     return values
 
 
+def _coerce_research(raw: dict, problems: list[str]) -> dict:
+    """Validate the ``[research]`` table into raw values for ResearchConfig."""
+    values: dict = {}
+    known = {"nvd_api_key", "timeout_each", "max_bytes"}
+    for key in raw:
+        if key not in known:
+            problems.append(f"unknown [research] key {key!r} ignored")
+    if "nvd_api_key" in raw:
+        if isinstance(raw["nvd_api_key"], str):
+            values["nvd_api_key"] = raw["nvd_api_key"].strip()
+        else:
+            problems.append("[research] nvd_api_key must be a string")
+    if "timeout_each" in raw:
+        value = raw["timeout_each"]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+            problems.append("[research] timeout_each must be a positive number")
+        else:
+            values["timeout_each"] = float(value)
+    if "max_bytes" in raw:
+        value = raw["max_bytes"]
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            problems.append("[research] max_bytes must be a positive integer")
+        else:
+            values["max_bytes"] = value
+    return values
+
+
 def _coerce(raw: dict) -> tuple[dict, list[str]]:
     known = {
         "kimi_bin",
@@ -149,6 +204,7 @@ def _coerce(raw: dict) -> tuple[dict, list[str]]:
         "audit_path",
         "extra_env",
         "osint",
+        "research",
     }
     values: dict = {}
     problems: list[str] = []
@@ -216,6 +272,14 @@ def _coerce(raw: dict) -> tuple[dict, list[str]]:
             values["osint"] = OsintConfig(**_coerce_osint(raw["osint"], problems))
         else:
             problems.append("[osint] must be a table ([osint] python = ...)")
+
+    if "research" in raw:
+        if isinstance(raw["research"], dict):
+            values["research"] = ResearchConfig(
+                **_coerce_research(raw["research"], problems)
+            )
+        else:
+            problems.append("[research] must be a table ([research] timeout_each = ...)")
 
     return values, problems
 
@@ -296,6 +360,13 @@ def dumps(config: Config) -> str:
         f"python = {_format_value(config.osint.python_bin)}",
         f"script = {_format_value(config.osint.script)}",
         f"timeout_each = {config.osint.timeout_each:g}",
+        "",
+        "[research]",
+        "# Passive vulnerability research: scrapes NVD / Exploit-DB on the fly.",
+        "# Optional NVD API key (raises the rate limit); NVD_API_KEY env wins.",
+        f"nvd_api_key = {_format_value(config.research.nvd_api_key)}",
+        f"timeout_each = {config.research.timeout_each:g}",
+        f"max_bytes = {config.research.max_bytes}",
     ]
     return "\n".join(lines) + "\n"
 

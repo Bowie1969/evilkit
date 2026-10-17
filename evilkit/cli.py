@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import sys
@@ -32,7 +33,7 @@ EXIT_USAGE = 2
 #: holds everything, and --osint-accept matches against the full set.
 OSINT_DISPLAY_LIMIT = 50
 
-COMMANDS = ("run", "osint", "scope", "log", "watch", "doctor", "theme", "config", "agent", "version")
+COMMANDS = ("run", "osint", "research", "scope", "log", "watch", "doctor", "theme", "config", "agent", "version")
 
 _EPILOG = """\
 examples:
@@ -42,6 +43,7 @@ examples:
   evilkit -s solo                    accept the locked-down default
   evilkit run --osint example.com    passive OSINT first, then pick the scope
   evilkit osint example.com          passive recon only; never launches
+  evilkit research CVE-2021-44228    passive vuln research; never launches
   evilkit --no-write -- -c           leave .mcp.json alone, resume a session
   evilkit scope show                 print the scope recorded in .mcp.json
   evilkit scope add 10.0.0.0/24      widen the record by one network
@@ -188,6 +190,40 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="also write the osint MCP server into the engagement .mcp.json, "
              "so the next kimi session here has the recon tools (never launches)",
+    )
+    research_cmd = sub.add_parser(
+        "research",
+        help="passive vulnerability research; never launches anything",
+        description="Passive vuln research: scrape public NVD / Exploit-DB and "
+                    "public pages only. Prints findings and writes "
+                    "research-findings.json; nothing is probed and nothing "
+                    "launches.",
+    )
+    research_cmd.add_argument(
+        "query",
+        nargs="+",
+        metavar="QUERY",
+        help="a CVE id, a product/version string, or a public http(s) URL",
+    )
+    research_cmd.add_argument(
+        "--only", metavar="TOOLS", help="comma-separated subset of tools to run"
+    )
+    research_cmd.add_argument(
+        "--skip", metavar="TOOLS", help="comma-separated tools to drop"
+    )
+    research_cmd.add_argument(
+        "--json",
+        dest="json_path",
+        type=Path,
+        metavar="PATH",
+        help="write findings to PATH (default: research-findings.json here)",
+    )
+    research_cmd.add_argument(
+        "--attach",
+        action="store_true",
+        help="also write the research MCP server into the engagement .mcp.json, "
+             "so the next kimi session here can scrape vuln intel mid-run "
+             "(never launches)",
     )
     scope_cmd = sub.add_parser("scope", help="inspect or change the recorded scope")
     scope_sub = scope_cmd.add_subparsers(dest="scope_command", metavar="ACTION")
@@ -1085,6 +1121,10 @@ def _cmd_doctor(config: config_mod.Config, problems: list[str]) -> int:
     _out(f"osint server      : {'available' if osint_ok else 'not installed (optional)'} "
          f"({osint_script})")
 
+    research_ok = Path(sys.executable).is_file()
+    _out(f"research server   : {'available' if research_ok else 'MISSING'} "
+         f"(python -m evilkit.research)")
+
     for problem in problems:
         _warn(problem)
 
@@ -1162,6 +1202,151 @@ def _cmd_osint(args, config: config_mod.Config, problems: list[str]) -> int:
     return EXIT_OK
 
 
+def _format_cve(data: dict) -> list[str]:
+    """One CVE as a compact block of lines."""
+    lines = [f"CVE       : {data.get('id', '?')}"]
+    if data.get("severity"):
+        score = data.get("base_score")
+        score_text = f"  (CVSS {data.get('cvss_version')} {score})" if score else ""
+        lines.append(f"Severity  : {data['severity']}{score_text}")
+    if data.get("cvss_vector"):
+        lines.append(f"Vector    : {data['cvss_vector']}")
+    if data.get("published"):
+        lines.append(f"Published : {data['published']}")
+    if data.get("description"):
+        lines.append("")
+        lines.append(f"  {data['description']}")
+    if data.get("weaknesses"):
+        lines.append("")
+        lines.append(f"Weaknesses: {', '.join(data['weaknesses'][:10])}")
+    if data.get("cpes"):
+        lines.append("")
+        lines.append("CPEs:")
+        for cpe in data["cpes"][:10]:
+            lines.append(f"  {cpe}")
+    if data.get("references"):
+        lines.append("")
+        lines.append("References:")
+        for ref in data["references"][:10]:
+            lines.append(f"  {ref}")
+    return lines
+
+
+def _render_research_findings(findings: list[dict]) -> list[str]:
+    """Flatten the findings doc into a readable set of lines for the terminal."""
+    lines: list[str] = []
+    for item in findings:
+        source = item.get("source", "")
+        data = item.get("data", {}) or {}
+        if source == "research_cve":
+            lines.extend(_format_cve(data))
+        elif source == "research_search":
+            lines.append(f"NVD search for {data.get('query', '?')!r}: "
+                         f"{data.get('total', len(data.get('results', [])))} results")
+            for row in data.get("results", []):
+                score = row.get("base_score")
+                severity = row.get("severity") or ""
+                lines.append(
+                    f"  {row.get('id', '?')}  {severity or '?'}"
+                    f"{f' ({score})' if score is not None else ''}"
+                )
+                desc = (row.get("description") or "").strip()
+                if desc:
+                    lines.append(f"      {desc[:200]}")
+        elif source == "research_exploits":
+            results = data.get("results", [])
+            lines.append(f"Exploits for {data.get('query', '?')!r}: "
+                         f"{len(results)} found ({data.get('source', 'none')})")
+            for row in results:
+                lines.append(
+                    f"  {row.get('id', '?')}  {row.get('title', '?')}"
+                )
+                if row.get("path"):
+                    lines.append(f"      {row['path']}")
+        elif source == "research_scrape":
+            lines.append(f"Scraped {data.get('url', '?')} "
+                         f"(HTTP {data.get('status', '?')}, {data.get('size', 0)} bytes)")
+            if data.get("title"):
+                lines.append(f"Title: {data['title']}")
+            for heading in (data.get("headings") or [])[:10]:
+                lines.append(f"  # {heading}")
+            text = (data.get("text") or "").strip()
+            if text:
+                lines.append("")
+                lines.append(text[:2000])
+        else:
+            lines.append(f"{source}: {json.dumps(data)[:500]}")
+        lines.append("")
+    return lines
+
+
+def _cmd_research(args, config: config_mod.Config, problems: list[str]) -> int:
+    """Passive vuln research: scrape public intel, never probe, never launch."""
+    from . import research as research_mod
+
+    for problem in problems:
+        _warn(problem)
+
+    query = " ".join(args.query).strip()
+    if not query:
+        _warn("research needs a query (CVE id, product/version, or public URL)")
+        return EXIT_USAGE
+
+    def _event(message: str) -> None:
+        _out(f"{PROG}: research {message}")
+
+    try:
+        findings = research_mod.run_research(
+            query,
+            only=_split_tools(args.only),
+            skip=_split_tools(args.skip),
+            timeout=config.research.timeout_each,
+            max_bytes=config.research.max_bytes,
+            nvd_api_key=config.research.resolved_api_key(),
+            on_event=_event,
+        )
+    except research_mod.ResearchError as exc:
+        _warn(str(exc))
+        return EXIT_USAGE
+
+    target = args.json_path if args.json_path is not None else Path.cwd() / "research-findings.json"
+    try:
+        written = research_mod.write_findings(findings, target)
+    except OSError as exc:
+        _warn(f"could not write {target}: {exc}")
+        written = None
+
+    failed = [run for run in findings.get("runs", []) if run.get("status") != "ok"]
+    _out()
+    for line in _render_research_findings(findings.get("findings", [])):
+        _out(line)
+    _out()
+    _out(f"{len(findings.get('findings', []))} source(s), "
+         f"{len(failed)} error(s)")
+    if written is None:
+        return EXIT_ERROR
+
+    if args.attach:
+        mcp_path = _resolve_mcp_path(None)
+        if mcp_path is None:
+            _warn("no .mcp.json here or in any parent directory; nothing to attach to")
+            return EXIT_ERROR
+        try:
+            changed = mcpscope.ensure_research_server(
+                mcp_path,
+                [sys.executable, "-m", "evilkit.research"],
+                keep_backups=config.backup_keep,
+            )
+        except mcpscope.McpError as exc:
+            _warn(f"could not attach the research MCP server ({exc})")
+            return EXIT_ERROR
+        state = "attached in" if changed else "already attached to"
+        _out(f"{PROG}: research MCP server {state} {mcp_path}")
+
+    _out(f"{PROG}: findings -> {written}")
+    return EXIT_OK
+
+
 def _cmd_theme(args) -> int:
     if args.action == "install":
         edited = theme_mod.is_modified()
@@ -1221,6 +1406,9 @@ def _cmd_config(args, config: config_mod.Config, problems: list[str]) -> int:
     _out(f"osint python    = {config.osint.python_bin}")
     _out(f"osint script    = {config.osint.script}")
     _out(f"osint timeout   = {config.osint.timeout_each:g}")
+    _out(f"research timeout = {config.research.timeout_each:g}")
+    _out(f"research max_bytes = {config.research.max_bytes}")
+    _out(f"research nvd_key = {'set' if config.research.resolved_api_key() else 'unset'}")
     _out(f"config file     = {config.source or config_mod.config_path()}")
     for problem in problems:
         _warn(problem)
@@ -1344,6 +1532,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_run(args, config, problems)
     if args.command == "osint":
         return _cmd_osint(args, config, problems)
+    if args.command == "research":
+        return _cmd_research(args, config, problems)
     if args.command == "scope":
         return _cmd_scope(args, config)
     if args.command == "log":

@@ -155,6 +155,77 @@ script = "/home/will_cyber/tools/osint-mcp/server.py"
 timeout_each = 240
 ```
 
+## Worked example: passive vulnerability research
+
+The `research` command answers a different question, mid-engagement: *what does public vuln intel
+say about the software this target runs?* You hand it a CVE id, a product/version string, or a
+public advisory URL; it scrapes NVD and Exploit-DB and returns structured context — never probing
+the target, never launching a session.
+
+```console
+$ evilkit research CVE-2021-44228
+evilkit: research research_cve CVE-2021-44228 ...
+evilkit: research research_cve CVE-2021-44228: ok
+
+CVE       : CVE-2021-44228
+Severity  : CRITICAL  (CVSS 3.1 10.0)
+Vector    : CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H
+  JNDI lookup in Apache Log4j allows remote code execution...
+Weaksess: CWE-502
+CPEs:
+  cpe:2.3:a:apache:log4j:2.0:*:*:*:*:*:*:*
+References:
+  https://logging.apache.org/log4j/2.x/security.html
+
+1 source(s), 0 error(s)
+evilkit: findings -> /srv/engagements/acme/research-findings.json
+```
+
+A product or version string runs two tools — an NVD keyword search and an exploit search (local
+`searchsploit`, falling back to the Exploit-DB site):
+
+```console
+$ evilkit research "apache 2.4.49"
+evilkit: research research_search apache 2.4.49 ...
+evilkit: research research_search apache 2.4.49: ok
+evilkit: research research_exploits apache 2.4.49 ...
+evilkit: research research_exploits apache 2.4.49: ok
+
+NVD search for 'apache 2.4.49': 42 results
+  CVE-2021-41773  CRITICAL (9.8)
+      Apache HTTP Server 2.4.49 path traversal...
+Exploits for 'apache 2.4.49': 3 found (searchsploit)
+  EDB-50383  Apache 2.4.49 - Path Traversal and RCE
+
+2 source(s), 0 error(s)
+evilkit: findings -> research-findings.json
+```
+
+A public URL is scraped as readable text, links, headings and forms:
+
+```console
+$ evilkit research https://www.cvedetails.com/cve/CVE-2021-44228/ --only research_scrape
+```
+
+Two boundaries hold by construction and are worth restating. The stage is **passive** — it only
+hits public vulnerability-intelligence infrastructure and pages you name, never the authorised
+target (that is the pentest server's job). And it is **SSRF-guarded** — a URL is fetched only after
+its hostname resolves to a globally routable address, re-checked on every redirect, so loopback,
+RFC1918, link-local and the cloud metadata service (`169.254.169.254`) are refused before any bytes
+leave the box.
+
+To give the launched session the same four tools so it can scrape vuln intel mid-run, use
+`research --attach`, which writes `mcpServers.research` (`python -m evilkit.research`) beside the
+recorded scope. Unlike the external osint server, this one ships with evilkit, so there is nothing
+extra to install. Configuration lives in the `[research]` table:
+
+```toml
+[research]
+nvd_api_key = ""   # optional; NVD_API_KEY env wins. Raises the NVD rate limit.
+timeout_each = 30
+max_bytes = 1048576
+```
+
 ## Worked example: preparing an engagement
 
 A project directory needs a `pentest` MCP server before evilkit can do anything useful. The shape it

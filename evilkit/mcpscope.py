@@ -36,11 +36,13 @@ __all__ = [
     "DENY_ENV_KEY",
     "SERVER_NAME",
     "OSINT_SERVER_NAME",
+    "RESEARCH_SERVER_NAME",
     "find",
     "read_scope",
     "read_deny",
     "write_scope",
     "ensure_osint_server",
+    "ensure_research_server",
     "prune_backups",
     "looks_like_backup",
 ]
@@ -49,6 +51,7 @@ SCOPE_ENV_KEY = "PENTEST_ALLOWED_TARGETS"
 DENY_ENV_KEY = "PENTEST_DENIED_TARGETS"
 SERVER_NAME = "pentest"
 OSINT_SERVER_NAME = "osint"
+RESEARCH_SERVER_NAME = "research"
 
 _BACKUP_RE = re.compile(r"\.(?P<stamp>\d{8}-\d{6})(?:-(?P<suffix>\d+))?\.bak$")
 
@@ -384,4 +387,42 @@ def ensure_osint_server(
         if servers.get(OSINT_SERVER_NAME) == desired:
             return False
         servers[OSINT_SERVER_NAME] = desired
+        return _write_staged(path, data, keep_backups, dry_run=False)
+
+
+def ensure_research_server(
+    path: Path, command: list[str], keep_backups: int = 5, dry_run: bool = False
+) -> bool:
+    """Declare the passive research MCP server (``evilkit.research``) in ``path``.
+
+    ``command`` is ``[python, "-m", "evilkit.research"]``. Unlike the osint
+    server (an external script), the research server ships with evilkit, so the
+    entry also sets ``PYTHONPATH`` to the directory that holds the ``evilkit``
+    package — correct whether evilkit is installed or run from a checkout, and
+    harmless when that directory is already on the interpreter's path.
+    """
+    if not command or not command[0]:
+        raise McpError("research server command must be [python, -m, evilkit.research]")
+    package_parent = str(Path(__file__).resolve().parent.parent)
+    desired = {
+        "type": "stdio",
+        "command": command[0],
+        "args": list(command[1:]),
+        "env": {"PYTHONPATH": package_parent},
+    }
+    if dry_run:
+        data = _load(path)
+        servers = data.get("mcpServers")
+        return not (
+            isinstance(servers, dict) and servers.get(RESEARCH_SERVER_NAME) == desired
+        )
+
+    with _locked(path):
+        data = _load(path)
+        servers = data.setdefault("mcpServers", {})
+        if not isinstance(servers, dict):
+            raise McpError(f"{path}: 'mcpServers' is not an object")
+        if servers.get(RESEARCH_SERVER_NAME) == desired:
+            return False
+        servers[RESEARCH_SERVER_NAME] = desired
         return _write_staged(path, data, keep_backups, dry_run=False)

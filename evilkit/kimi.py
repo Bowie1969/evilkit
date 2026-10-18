@@ -453,6 +453,16 @@ def _launch_env(
     env["EVILKIT_STATE_DIR"] = str(state_dir())
     if dashboard_run_dir is not None:
         env["EVILKIT_DASHBOARD_RUN_DIR"] = str(dashboard_run_dir.expanduser().resolve())
+        # Fresh mission ledger per published run. The mission MCP defaults to a
+        # shared state file, so without this a run inherits the prior run's
+        # findings/flags/witnesses — run 8 started from a 2026-10-13 ledger and
+        # had to treat the whole run as contaminated. Keyed by the run id, the
+        # ledger is reused across supervised relaunches of the SAME run and
+        # starts clean on the next published run. An operator-set
+        # CO_MISSION_STATE_PATH always wins.
+        mission_dir = state_dir() / "missions"
+        mission_dir.mkdir(parents=True, exist_ok=True)
+        env.setdefault("CO_MISSION_STATE_PATH", str(mission_dir / f"{dashboard_run_dir.name}.json"))
     # The harness locates its run dir and entry host from these.
     env.setdefault("EVILKIT_ENTRY_HOST", "10.99.50.60")
     # Guest credentials for the malware-scripting MCP's ssh-backed tools. The MCP
@@ -1096,6 +1106,22 @@ def main(argv: list[str] | None = None) -> int:
             return EXIT_USAGE
         if args.scope is None and profile.scope:
             args.scope = profile.scope
+        if profile.dashboard_run_dir is not None:
+            profile_run = profile.dashboard_run_dir.expanduser().resolve()
+            if args.dashboard_run_dir is None:
+                # The profile is the launch contract, not merely a preflight
+                # checklist.  Run 9 validated the profile's dashboard path but
+                # launched without exporting it, leaving 139 calls and no
+                # scorer journal.  Bind the declared run here so the hook and
+                # launch environment use the same directory preflight checked.
+                args.dashboard_run_dir = profile_run
+            elif args.dashboard_run_dir.expanduser().resolve() != profile_run:
+                _warn(
+                    "dashboard run mismatch: --dashboard-run-dir resolves to "
+                    f"{args.dashboard_run_dir.expanduser().resolve()}, but run profile "
+                    f"{profile.name!r} declares {profile_run}"
+                )
+                return EXIT_USAGE
         _out(f"{PROG}: run profile {profile.name} ({profile.source})")
 
     scope_from_flag = args.scope is not None
@@ -1160,6 +1186,8 @@ def main(argv: list[str] | None = None) -> int:
         _out(f"{PROG}: argv -> {' '.join([kimi, *launch_argv])}")
         _out(f"{PROG}: agent file -> {agent_path}")
         _out(f"{PROG}: model alias -> {model_alias}")
+        if args.dashboard_run_dir is not None:
+            _out(f"{PROG}: dashboard run -> {args.dashboard_run_dir.expanduser().resolve()}")
         return EXIT_OK
 
     if args.dashboard_run_dir is not None:

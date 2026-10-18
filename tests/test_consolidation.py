@@ -118,6 +118,51 @@ class ConsolidationTests(unittest.TestCase):
         self.assertEqual(event["node"], "target")
         self.assertEqual(event["edge"]["traffic_class"], "attack")
 
+    def test_a_pivot_call_journals_source_and_destination(self) -> None:
+        """The scorer reads host/src as the pivot source and target as the far
+        end; run 8 pivoted over raw Bash (journaled as recon) and scored 0."""
+        (self.run / "dashboard" / "topology.json").write_text(json.dumps({"nodes": [
+            {"id": "entry", "address": "10.99.50.60"},
+            {"id": "jump", "address": "10.99.50.21"},
+            {"id": "corp", "address": "10.50.0.14"},
+        ]}), encoding="utf-8")
+        bridge = DashboardTelemetry(self.run)
+        event = bridge.emit_action(
+            "mcp ssh_tunnel 10.99.50.21 1080 10.50.0.14 22", 0, "ssh_tunnel",
+            engine="kimi", session_id="s1",
+        )
+        journal = json.loads((self.run / "journal.jsonl").read_text())
+        self.assertEqual(event["event"], "host_compromised")  # board sees an attack on the jump
+        self.assertEqual(journal["event"], "pivot")
+        self.assertEqual(journal["host"], "10.99.50.21")
+        self.assertEqual(journal["target"], "10.50.0.14")
+
+    def test_a_failed_pivot_is_recon_not_pivot(self) -> None:
+        (self.run / "dashboard" / "topology.json").write_text(json.dumps({"nodes": [
+            {"id": "entry", "address": "10.99.50.60"},
+            {"id": "jump", "address": "10.99.50.21"},
+            {"id": "corp", "address": "10.50.0.14"},
+        ]}), encoding="utf-8")
+        bridge = DashboardTelemetry(self.run)
+        bridge.emit_action(
+            "mcp ssh_tunnel 10.99.50.21 1080 10.50.0.14 22", 1, "ssh_tunnel",
+            engine="kimi", session_id="s1",
+        )
+        journal = json.loads((self.run / "journal.jsonl").read_text())
+        self.assertEqual(journal["event"], "recon")
+
+    def test_a_banked_flag_journals_as_exfil_with_the_token(self) -> None:
+        """The crown-exfil scorer searches journal text for the flag value, so a
+        record_flag call must carry the token into the journal."""
+        bridge = DashboardTelemetry(self.run)
+        bridge.emit_action(
+            "record_flag FLAG{CROWN-1} from 10.99.50.11", 0, "record_flag",
+            engine="kimi", session_id="s1",
+        )
+        journal = json.loads((self.run / "journal.jsonl").read_text())
+        self.assertEqual(journal["event"], "exfil")
+        self.assertIn("FLAG{CROWN-1}", journal["evidence"])
+
     def test_failed_attack_action_stays_an_attempt(self) -> None:
         bridge = DashboardTelemetry(self.run)
         event = bridge.emit_action(

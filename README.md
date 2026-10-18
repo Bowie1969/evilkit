@@ -19,6 +19,7 @@ enrolled lab workers one auditable operating layer.
 |---|---:|---|---|
 | Keystone 6 | 68/110; 68/79 reachable points | Valid operational baseline | Three verified footholds, four running workers, scope-gated evidence in 18.7 minutes |
 | Keystone 7 | 68/110 | Invalid as a cold-start benchmark | Broader compromise, but stale state and harness leakage exposed measurement weaknesses |
+| Keystone 9 | 0/129 | Invalid; evidence binding absent | Useful wire activity, but two dashboard records and no scorer journal or capture evidence |
 
 The second result is as important as the first: EvilKit records enough detail
 to distinguish system capability from benchmark contamination. The published

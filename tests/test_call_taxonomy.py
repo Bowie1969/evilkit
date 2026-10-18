@@ -150,6 +150,31 @@ class TestOtherLogShapes(TaxonomyCase):
         self.assertEqual(report["counts"]["timeout"], 0)
         self.assertEqual(report["counts"]["productive"], 1)
 
+    def test_nested_command_failure_is_barren_even_with_output(self):
+        """Run 9's proxy wrapper returned JSON-RPC success for failed curl calls."""
+        records = [
+            {"type": "context.append_loop_event",
+             "event": {"type": "tool.call", "toolCallId": "t1",
+                       "name": "mcp__pentest__proxy_via_host",
+                       "args": {"command": "curl http://10.50.0.14:22/"}}},
+            {"type": "context.append_loop_event",
+             "event": {"type": "tool.result", "toolCallId": "t1",
+                       "result": {"output": "curl: (7) Failed to connect to "
+                                            "10.50.0.14 port 22: Could not connect to server"}}},
+        ]
+        report = tax.taxonomy(self.write_log(records))
+        self.assertEqual(report["counts"]["barren"], 1)
+        self.assertEqual(report["counts"]["productive"], 0)
+
+    def test_proxy_policy_rejection_is_a_gate_refusal(self):
+        records = [
+            {"kind": "action", "tool": "proxy_via_host", "command": "x",
+             "output": "ERROR: shell operators are not allowed in proxied command",
+             "returncode": 0},
+        ]
+        report = tax.taxonomy(self.write_log(records))
+        self.assertEqual(report["counts"]["gate_refusal"], 1)
+
 
 class TestCli(TaxonomyCase):
     def test_classify_prints_a_report(self):

@@ -277,6 +277,34 @@ class TestProfileLaunch(ProfileCase):
         self.assertEqual(code, 2)
         self.assertIn("run profile rejected", err)
 
+    def test_profile_dashboard_directory_is_bound_to_the_launch(self):
+        self.declare_pentest()
+        run_dir = self.run_dir_with_topology("10.99.50.60")
+        profile = self.write_profile(
+            'name = "bound"\nscope = "10.99.50.0/24"\n'
+            f'dashboard_run_dir = "{run_dir}"\n'
+        )
+        code, out, err = self.call_main([
+            "kimi", "--dry-run", "--no-write", "--run-profile", str(profile)
+        ])
+        self.assertEqual(code, 0, err)
+        self.assertIn(f"dashboard run -> {run_dir.resolve()}", out)
+
+    def test_cli_dashboard_cannot_disagree_with_the_profile(self):
+        self.declare_pentest()
+        run_dir = self.run_dir_with_topology("10.99.50.60")
+        other = self.tmp / "another-run"
+        profile = self.write_profile(
+            'name = "bound"\nscope = "10.99.50.0/24"\n'
+            f'dashboard_run_dir = "{run_dir}"\n'
+        )
+        code, _, err = self.call_main([
+            "kimi", "--dry-run", "--no-write", "--run-profile", str(profile),
+            "--dashboard-run-dir", str(other),
+        ])
+        self.assertEqual(code, 2)
+        self.assertIn("dashboard run mismatch", err)
+
 
 if __name__ == "__main__":
     unittest.main()

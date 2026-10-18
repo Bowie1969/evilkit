@@ -102,6 +102,22 @@ _REFUSAL_PATTERNS = (
     "gate result",
     "harness guard",
     "denied —",
+    "shell operators are not allowed",
+)
+
+# MCP wrappers often return a successful JSON-RPC response even though the
+# command inside it failed.  Those results have no top-level return code, so
+# classifying every non-empty response as productive badly inflated Run 9's
+# useful-call count.  Keep these conservative and result-only: they are common
+# terminal failure strings, not words that appear in a normal finding.
+_BARREN_PATTERNS = (
+    "could not connect to server",
+    "failed to connect to",
+    "no such file or directory",
+    "operation not permitted",
+    "command not found",
+    "network is unreachable",
+    "no route to host",
 )
 
 _WS = re.compile(r"\s+")
@@ -176,6 +192,16 @@ def category(call: Call) -> str:
     for name in ("timeout", "auth_failure", "proven_finding"):
         if _matches(text, _RESULT_PATTERNS[name]):
             return name
+    barren_match = _matches(text, _BARREN_PATTERNS)
+    # A compound local Bash inspection can legitimately print one missing-file
+    # diagnostic alongside useful evidence.  Proxy wrappers are single remote
+    # actions, while a result beginning with an error is unambiguously failed;
+    # constrain the heuristic to those shapes to avoid discarding mixed output.
+    if barren_match and (
+        call.tool.endswith("proxy_via_host")
+        or text.lstrip().lower().startswith(("[stderr]", "error:", "curl:"))
+    ):
+        return "barren"
     if call.returncode not in (None, 0):
         return "barren"
     stripped = text.strip()

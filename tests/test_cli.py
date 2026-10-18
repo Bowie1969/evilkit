@@ -827,6 +827,44 @@ class TestExtraEnvCannotOverrideTheScope(CliTestCase):
         self.assertEqual(env["PENTEST_ALLOWED_TARGETS"], "10.0.0.0/24")
 
 
+class TestPerRunMissionLedger(CliTestCase):
+    """Run 8 inherited a 2026-10-13 mission ledger; a published dashboard run
+    must get its own CO_MISSION_STATE_PATH keyed by the run id."""
+
+    def test_dashboard_run_gets_a_fresh_ledger_path(self):
+        from pathlib import Path
+
+        from evilkit.config import Config
+
+        run = self.tmp / "runs" / "20261016-000000-deadbeef"
+        with mock.patch.dict(os.environ, {"EVILKIMI_STATE_DIR": str(self.tmp / "state")}):
+            env = kimi._launch_env(Config(), "10.99.50.0/24", "kimi-code/k3", run)
+
+        expected = self.tmp / "state" / "missions" / "20261016-000000-deadbeef.json"
+        self.assertEqual(env["CO_MISSION_STATE_PATH"], str(expected))
+        self.assertTrue(Path(env["CO_MISSION_STATE_PATH"]).parent.is_dir())
+
+    def test_operator_set_ledger_path_wins(self):
+        from evilkit.config import Config
+
+        run = self.tmp / "runs" / "20261016-000000-deadbeef"
+        with mock.patch.dict(os.environ, {
+            "EVILKIMI_STATE_DIR": str(self.tmp / "state"),
+            "CO_MISSION_STATE_PATH": "/operator/picked/ledger.json",
+        }):
+            env = kimi._launch_env(Config(), "10.99.50.0/24", "kimi-code/k3", run)
+
+        self.assertEqual(env["CO_MISSION_STATE_PATH"], "/operator/picked/ledger.json")
+
+    def test_no_dashboard_run_leaves_the_ledger_alone(self):
+        from evilkit.config import Config
+
+        with mock.patch.dict(os.environ, {"EVILKIMI_STATE_DIR": str(self.tmp / "state")}):
+            env = kimi._launch_env(Config(), "10.99.50.0/24", "kimi-code/k3", None)
+
+        self.assertNotIn("CO_MISSION_STATE_PATH", env)
+
+
 class TestConfigCommand(CliTestCase):
     def test_path_prints_the_environment_override(self):
         code, out, err = self.call_main(["config", "path"])

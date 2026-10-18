@@ -1,17 +1,124 @@
 # EvilKit
 
-An evidence-first, scope-gated control plane for authorized AI security
-testing. EvilKit gives Kimi Code, Qwen Code, Keystone telemetry, and explicitly
-enrolled lab workers one auditable operating layer.
+![Python](https://img.shields.io/badge/python-3.11%2B-blue) ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS-lightgrey) ![License](https://img.shields.io/badge/license-commercial%20source--available-orange) ![Status](https://img.shields.io/badge/status-research%20alpha-red)
 
-> **Status:** source-available research alpha. Use only on systems you have
-> written permission to test. See the [commercial licence](LICENSE) and
-> [security policy](SECURITY.md).
+**One auditable, scope-gated control plane for authorized AI security testing — fail-closed by default, evidence-first by design.**
+
+## What it is
+
+EvilKit gives the Kimi Code CLI, Qwen Code, Keystone telemetry, and explicitly
+enrolled lab workers a single auditable operating layer. It records the
+authorized target scope into the right place *before* any session starts,
+journals every launch, and scores runs from harness-collected telemetry rather
+than self-report. A passive OSINT stage, a reversible learning ledger, and an
+enrolled-worker mesh all sit behind the same fail-closed scope gate.
+
+> **Authorized use only.** EvilKit is source-available research alpha. Use it
+> only on systems you have written permission to test. See the [commercial
+> licence](LICENSE) and [security policy](SECURITY.md).
+
+## Highlights
+
+- **Fail-closed scope gate.** The authorized target list is recorded into
+  `.mcp.json` — atomically, with backups and a lock — before any session starts;
+  if it cannot be recorded, nothing launches.
+- **Evidence-first scoring.** Runs are scored from harness telemetry (journal,
+  filesystem diffs, beacons, pcaps), not self-report, and published run reports
+  separate capability from benchmark contamination.
+- **Passive OSINT stage.** Recon from public feeds and registries only; a
+  finding becomes scope only when a human deliberately picks it.
+- **Reversible learning ledger.** Thresholded lessons distilled from completed
+  runs, with rollback.
+- **Enrolled-worker mesh.** Token enrollment, sandboxed and allowlisted
+  commands, a kill switch, and live clone-terminal display gated to the attack
+  segment.
+- **Honeypot → arsenal red/blue loop.** An 18-day Cowrie honeypot capture is
+  distilled into five campaigns and turned back into inert, scope-gated
+  adversary emulation with matching detections.
 
 [Executive brief for Baidam Solutions](docs/baidam-solutions-brief.md) ·
 [Run evidence](docs/runs/README.md) ·
 [Operator guide](docs/usage.md) ·
-[Architecture and demo](docs/baidam-solutions-brief.md#ten-minute-demo)
+[Honeypot → arsenal](#from-honeypot-to-arsenal-the-redblue-loop) ·
+[Architecture](#architecture)
+
+## From honeypot to arsenal (the red/blue loop)
+
+The through-line of this project: **defense observes real attackers, offense
+emulates proven techniques against authorized targets only.** A
+[Cowrie](https://github.com/cowrie/cowrie) SSH honeypot (`prod-db-01`) captured
+~18 days of live internet-facing SSH traffic — **547,857 events across 99,353
+sessions from 1,605 source IPs** — and the analysis surfaced **five campaigns**:
+
+| Campaign | Observed in the wild | Emulated in evilkit (inert, scope-gated) |
+|---|---|---|
+| Mirai `handshakebins` loader | multi-protocol fetch (wget/curl/tftp/ftp) of a shell dropper, `kworker` masquerading, self-delete | transfer-ladder emulation: each protocol pulls an inert marker, a canary is written under a `kworker`-style name |
+| Multi-arch IoT dropper | `cat.sh` + `iran.{x86_64,aarch64,m68k}` staged per target architecture | arch-aware staging (`uname -m` → arch-matched marker); no binary executes |
+| Self-propagating SSH worm | plants a hardcoded ed25519 key, disables host-key checking, `scp`s a second stage | key-reuse lateral movement: a single operator-confirmed hop — no loop, no discovery |
+| Open-relay / SOCKS abuse | 12,744 `direct-tcpip` tunnel attempts toward Yahoo/Google/Cloudflare | tunnel emulation against a lab-controlled endpoint only |
+| Windows RDP tooling drop | `rdpcIip.exe`, `sqhost.exe`, 7z self-extractors | documented + detected; no live payload |
+
+The best-observed techniques were turned back into evilkit as **inert
+adversary-emulation capabilities**, each mapped to MITRE ATT&CK and shipped with
+the detection it should have triggered:
+
+- **Field-observed SSH dictionaries** — the most successful credentials
+  (`admin:admin` ×5,434, standard root dictionaries) become a small, declared,
+  rate-limited credential-spray module (ATT&CK T1110 Brute Force, T1595 Active
+  Scanning).
+- **Multi-arch transfer ladder** — architecture probing followed by an
+  arch-matched download (ATT&CK T1105 Ingress Tool Transfer, T1588.001).
+- **Key-reuse worm technique** — hardcoded-key lateral movement with host-key
+  checking disabled (ATT&CK T1552.004 Private Keys, T1098.004 SSH Authorized
+  Keys, T1021.004 SSH).
+
+The emulation obeys the same scope gate as the rest of evilkit: no live malware
+payloads, no self-propagation, no autonomous target discovery — every action
+runs only against a target already in `PENTEST_ALLOWED_TARGETS`, fails closed
+off-scope, and emits an evidence record tagged with its ATT&CK ID and the
+honeypot artifact it derives from. Full mapping and build plan:
+[docs/honeypot-emulation-plan.md](docs/honeypot-emulation-plan.md).
+
+## Architecture
+
+```
+                       operator
+                         │
+           authorized scope (--scope · --osint-accept)
+                         │
+                         ▼
+                ┌─────────────────┐
+                │   scope gate     │   fail-closed: records the scope
+                │                  │   or starts nothing
+                └────────┬────────┘
+                         │ writes PENTEST_ALLOWED_TARGETS
+                         │ (atomic · backup · lock)
+                         ▼
+                   ┌────────────┐
+                   │  .mcp.json │   pentest MCP scope source
+                   └─────┬──────┘
+                         │ scope via env, then exec
+                         ▼
+           ┌────────────────────────────────┐
+           │  Kimi Code CLI / Qwen Code      │
+           │  + pentest MCP (scoped)         │
+           │  + osint MCP (passive)          │
+           └────────────────┬───────────────┘
+                            │
+      harness & circuit-breakers (budget limits, relay detection,
+      tool enforcement, evidence capture)
+                            │
+    ┌──────────────┬────────┴────────┬──────────────┐
+    ▼              ▼                 ▼              ▼
+┌──────────┐  ┌──────────┐  ┌──────────────┐  ┌──────────────┐
+│ dashboard │  │ mesh hub │  │  learning    │  │  run profile │
+│ telemetry │  │ + workers│  │  ledger      │  │  / audit log │
+└──────────┘  └──────────┘  └──────────────┘  └──────────────┘
+```
+
+The **bootable appliance** — a self-contained, reproducible operator system that
+seeds this same stack on fresh hardware — lives in the sister repository
+[`Bowie1969/evilkit-os`](https://github.com/Bowie1969/evilkit-os).
 
 ## Measured evidence
 
@@ -1128,18 +1235,20 @@ check, so it will write through a link where the subcommand refuses to. That cop
 
 ## Tests
 
-`python3 -m unittest discover -s tests -t .` from the project root runs the suite: 233 tests,
-covering the scope parser, the `.mcp.json` writer, the config loader, the theme installer, the
-launch log and the CLI. It passes. Run it before trusting a scripted pipeline to a change:
+The canonical suite is `pytest` — the `dev` extra in `pyproject.toml` pulls it
+in (from a venv: `pip install -e '.[dev]'`). From the project root:
 
 ```console
-$ python3 -m unittest discover -s tests -t .
-.........................................................................................................................................................................................................................................
-----------------------------------------------------------------------
-Ran 233 tests in 2.123s
-
-OK
+$ pytest -q
+...
+650 passed, 190 subtests passed in 31.83s
 ```
+
+It covers the scope parser, the `.mcp.json` writer, the config loader, the theme
+installer, the launch log, the CLI, dashboard control, mesh, the egress proxy
+and the learning ledger. The unittest subset runs with
+`python3 -m unittest discover -s tests -t .`. Run the suite before trusting a
+scripted pipeline to a change.
 
 ## Do not commit `.mcp.json`
 

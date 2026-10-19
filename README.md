@@ -273,6 +273,15 @@ enrolled nodes with a token, a filesystem sandbox, an allowlisted command set,
 and a kill switch. Nodes do not copy or install EvilKit on additional systems;
 deployment remains an operator-controlled provisioning step.
 
+On top of that, enrolled **instances** (full evilkit installs with their own
+agent) coordinate across devices: send directed messages, publish to
+channels, claim assets, update a shared objective board, and ask "who can
+reach this host?" — all behind ed25519-signed, replay-windowed requests
+and a journal that replays the whole board on restart. A message can ask,
+suggest, or share, but every action the receiving agent takes still runs
+through that device's own fail-closed scope gate. See
+[`docs/orchestration.md`](docs/orchestration.md).
+
 Completed hook sessions feed deterministic behavior metrics into the learning
 ledger. Only thresholded lessons are appended, every automatic batch is tagged,
 and `evilkit learn rollback` removes the most recent batch. Use `evilkit learn

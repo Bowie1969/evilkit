@@ -7,6 +7,7 @@ recording the hub's scope with evilkit's existing fail-closed scope writer.
 from __future__ import annotations
 
 import argparse
+import base64
 import codecs
 import collections
 import hashlib
@@ -33,10 +34,16 @@ import urllib.request
 import uuid
 from pathlib import Path
 
-from . import config as config_mod, mcpscope, scope as scope_mod
+from . import _ed25519, config as config_mod, mcpscope, orchestration, scope as scope_mod
 from .clone_display import SegmentError
 from .mesh_brief import BriefError, read_brief
+from .orchestration import Board, BoardError, canonical_request
 from .terminal_window import ClonePopupManager, spawn_terminal_window
+
+
+def _default_journal_dir() -> Path:
+    base = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local" / "state")
+    return Path(base) / "evilkit" / "mesh-hub"
 
 
 class MeshError(Exception):
@@ -124,6 +131,45 @@ def _request(base: str, token: str, path: str, data: dict | None = None) -> dict
         raise MeshError(f"could not reach hub: {exc}") from exc
 
 
+def _signed_request(
+    base: str,
+    *,
+    name: str,
+    sk: bytes,
+    pk: bytes,
+    method: str,
+    path: str,
+    data: dict | None = None,
+) -> dict:
+    """Send one signed instance request. Returns the hub's JSON response."""
+    body = b"" if data is None else json.dumps(data).encode("utf-8")
+    ts = f"{time.time():.6f}"
+    nonce = secrets.token_urlsafe(16)
+    msg = canonical_request(method, path, body, ts, nonce)
+    sig = _ed25519.sign(msg, sk, pk)
+    headers = {
+        "X-Evilkit-Node": name,
+        "X-Evilkit-Ts": ts,
+        "X-Evilkit-Nonce": nonce,
+        "X-Evilkit-Sig": base64.b64encode(sig).decode("ascii"),
+    }
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(
+        base + path,
+        data=body if data is not None else None,
+        headers=headers,
+        method=method.upper(),
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as response:
+            return json.load(response)
+    except urllib.error.HTTPError as exc:
+        raise MeshError(f"hub returned {exc.code}: {exc.read(256).decode('utf-8', 'replace')}") from exc
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+        raise MeshError(f"could not reach hub: {exc}") from exc
+
+
 class Hub:
     def __init__(
         self,
@@ -132,6 +178,9 @@ class Hub:
         *,
         brief: str | None = None,
         on_clone_up=None,
+        journal_path: Path | None = None,
+        hub_id: str | None = None,
+        dashboard_run_dir: Path | None = None,
     ):
         if (scope is None) == (brief is None):
             raise MeshError("hub needs exactly one of a recorded scope or engagement brief")
@@ -152,6 +201,65 @@ class Hub:
         self.node_tasks: dict[str, dict] = {}
         self.knowledge: list[dict] = []
         self.killed_nodes: set[str] = set()
+        # Orchestration board (phase 1-5): instance peers, inboxes, claims,
+        # objectives, journal replay. The hub creates one Board per lifetime;
+        # journal_path persists it across restarts.
+        self.hub_id = hub_id or uuid.uuid4().hex[:8]
+        if journal_path is None:
+            journal_path = _default_journal_dir() / self.hub_id / "journal.jsonl"
+        self.journal_path = Path(journal_path)
+        self.dashboard_run_dir = Path(dashboard_run_dir) if dashboard_run_dir else None
+        self.board = Board(
+            engagement_scope=scope,
+            journal_path=self.journal_path,
+            on_event=self._on_board_event,
+        )
+        self.board.replay()
+
+    def _on_board_event(self, kind: str, payload: dict) -> None:
+        # Mirror every coordination event into the tail/watch stream so an
+        # operator watching with `mesh watch` sees send/claim/objective traffic
+        # alongside worker output.
+        actor = payload.get("name") or payload.get("from") or payload.get("owner") or "hub"
+        task = payload.get("to") or payload.get("asset") or payload.get("id") or ""
+        detail = payload.get("subject") or payload.get("title") or payload.get("channel") or ""
+        self.sequence += 1
+        entry = {
+            "seq": self.sequence,
+            "time": payload.get("ts") or time.time(),
+            "worker": str(actor),
+            "task": str(task),
+            "kind": kind,
+            "text": str(detail),
+        }
+        self.events.append(entry)
+        # Dashboard telemetry, when a run dir is wired in.
+        if self.dashboard_run_dir is not None:
+            try:
+                from . import dashboard_telemetry
+                tel = dashboard_telemetry.DashboardTelemetry(self.dashboard_run_dir)
+                if kind == "msg_send" and payload.get("to"):
+                    tel.emit_action(
+                        f"orchestration_send {payload.get('to')}", 0,
+                        tool_name="orchestration_send",
+                        session_id=str(payload.get("from") or ""),
+                    )
+                elif kind == "claim_acquire":
+                    tel.emit_action(
+                        f"orchestration_claim {payload.get('asset')}", 0,
+                        tool_name="orchestration_claim",
+                        session_id=str(payload.get("owner") or ""),
+                    )
+                elif kind == "objective_upsert":
+                    tel.emit_action(
+                        f"orchestration_objective {payload.get('id')}", 0,
+                        tool_name="orchestration_objective",
+                        session_id=str(payload.get("owner") or ""),
+                    )
+            except Exception:
+                # Telemetry is best-effort; a failure here must never break
+                # coordination traffic.
+                pass
 
     def event(self, worker: str, task: str, kind: str, text: str = "") -> dict:
         self.sequence += 1
@@ -374,6 +482,22 @@ class Hub:
             }
 
 
+_SIGNED_PATHS = frozenset({
+    "/instance/register", "/instance/heartbeat", "/instance/status",
+    "/msg", "/msg/ack", "/inbox", "/channel/publish", "/channel/subscribe",
+    "/claim", "/claim/release", "/claims", "/objective", "/objectives",
+    "/peers",
+})
+
+_UNSIGNED_INSTANCE_PATHS = frozenset({
+    # The hub exposes these to the operator CLI under the bearer token so an
+    # operator can enroll a pubkey or revoke a name without needing a signing
+    # key of their own. Everything stateful about the enrolled peer still
+    # requires its signed requests.
+    "/instance/enroll", "/instance/revoke",
+})
+
+
 def _handler(hub: Hub):
     class Handler(http.server.BaseHTTPRequestHandler):
         def log_message(self, format: str, *args) -> None:
@@ -388,8 +512,45 @@ def _handler(hub: Hub):
             self.end_headers()
             self.wfile.write(payload)
 
-        def _dispatch(self, data: dict | None) -> dict:
+        def _verify_signature(self, body: bytes, path: str) -> str:
+            """Verify ed25519 signature headers and return the peer name."""
+            name = self.headers.get("X-Evilkit-Node", "")
+            ts = self.headers.get("X-Evilkit-Ts", "")
+            nonce = self.headers.get("X-Evilkit-Nonce", "")
+            sig_b64 = self.headers.get("X-Evilkit-Sig", "")
+            if not (name and ts and nonce and sig_b64):
+                raise MeshError("signed request requires X-Evilkit-{Node,Ts,Nonce,Sig} headers")
+            try:
+                sig = base64.b64decode(sig_b64, validate=True)
+                ts_float = float(ts)
+            except (ValueError, TypeError) as exc:
+                raise MeshError("invalid signature headers") from exc
+            pubkey_b64 = hub.board.get_pubkey(name)
+            if pubkey_b64 is None:
+                raise MeshError(f"instance {name} is not enrolled")
+            try:
+                pubkey = base64.b64decode(pubkey_b64, validate=True)
+            except ValueError as exc:
+                raise MeshError("stored pubkey is corrupt") from exc
+            msg = canonical_request(self.command, path, body, ts, nonce)
+            if not _ed25519.verify(sig, msg, pubkey):
+                raise MeshError("signature does not verify")
+            hub.board.check_nonce(name, nonce, ts_float)
+            return name
+
+        def _dispatch(self, data: dict | None, signer: str | None = None) -> dict:
             parsed = urllib.parse.urlsplit(self.path)
+            # --- orchestration endpoints (signed) ---
+            if signer is not None:
+                return self._dispatch_signed(parsed, data, signer)
+            if parsed.path == "/instance/enroll" and data is not None:
+                return hub.board.enroll_pubkey(
+                    name=data["name"],
+                    pubkey_b64=data["pubkey"],
+                    role=data.get("role", ""),
+                )
+            if parsed.path == "/instance/revoke" and data is not None:
+                return hub.board.revoke(data["name"])
             if self.command == "GET":
                 if parsed.path == "/state":
                     return hub.state()
@@ -454,22 +615,136 @@ def _handler(hub: Hub):
                     return hub.node_status()
             raise MeshError("unknown endpoint")
 
+        def _dispatch_signed(self, parsed, data: dict | None, signer: str) -> dict:
+            path = parsed.path
+            # Signed GET endpoints: /inbox, /instance/status, /claims,
+            # /objectives, /peers.
+            if self.command == "GET":
+                if path == "/inbox":
+                    query = urllib.parse.parse_qs(parsed.query)
+                    try:
+                        after = int(query.get("after", ["0"])[0])
+                    except ValueError:
+                        after = 0
+                    return hub.board.read_inbox(signer, after=after)
+                if path == "/instance/status":
+                    return hub.board.summary()
+                if path == "/claims":
+                    return {"claims": hub.board.list_claims()}
+                if path == "/objectives":
+                    return {"objectives": hub.board.list_objectives()}
+                if path == "/peers":
+                    query = urllib.parse.parse_qs(parsed.query)
+                    host = query.get("reaching", [None])[0]
+                    summary = hub.board.summary()
+                    if host:
+                        return {
+                            "peers": summary["peers"],
+                            "reaching": hub.board.peers_reaching(host),
+                        }
+                    return {"peers": summary["peers"]}
+                raise MeshError(f"unknown signed GET endpoint: {path}")
+            if data is None:
+                raise MeshError("signed POST requires a JSON body")
+            if path == "/instance/register":
+                return hub.board.register_instance(
+                    name=signer,
+                    pubkey_b64=data["pubkey"],
+                    role=data.get("role", ""),
+                    capabilities=data.get("capabilities") or [],
+                    position=data.get("position") or [],
+                )
+            if path == "/instance/heartbeat":
+                return hub.board.heartbeat(signer)
+            if path == "/msg":
+                return hub.board.send_message(
+                    from_name=signer,
+                    to_name=data["to"],
+                    subject=data.get("subject", ""),
+                    body=data.get("body"),
+                    reply_to=data.get("reply_to"),
+                    ttl=data.get("ttl"),
+                    secret=bool(data.get("secret")),
+                )
+            if path == "/msg/ack":
+                return hub.board.ack_messages(signer, data.get("ids") or [])
+            if path == "/channel/publish":
+                return hub.board.publish_channel(
+                    from_name=signer,
+                    channel=data["channel"],
+                    body=data.get("body"),
+                    subject=data.get("subject", ""),
+                    ttl=data.get("ttl"),
+                    secret=bool(data.get("secret")),
+                )
+            if path == "/channel/subscribe":
+                return hub.board.subscribe(
+                    signer, data["channel"], active=bool(data.get("active", True))
+                )
+            if path == "/claim":
+                return hub.board.acquire_claim(
+                    owner=signer,
+                    asset=data["asset"],
+                    ttl=data.get("ttl"),
+                )
+            if path == "/claim/release":
+                return hub.board.release_claim(owner=signer, asset=data["asset"])
+            if path == "/objective":
+                return hub.board.upsert_objective(
+                    from_name=signer,
+                    id=data.get("id"),
+                    title=data["title"],
+                    status=data.get("status", "queued"),
+                    owner=data.get("owner"),
+                    requires=data.get("requires") or [],
+                    evidence=data.get("evidence", ""),
+                )
+            raise MeshError(f"unknown signed POST endpoint: {path}")
+
         def _handle(self) -> None:
-            supplied = self.headers.get("Authorization", "")
-            if not hmac.compare_digest(supplied, f"Bearer {hub.token}"):
-                self._send(401, {"error": "unauthorized"})
-                return
+            parsed = urllib.parse.urlsplit(self.path)
+            is_signed = parsed.path in _SIGNED_PATHS
+            # Read body first so we can hash it for signature verification.
+            body = b""
+            if self.command == "POST":
+                length_hdr = self.headers.get("Content-Length", "0")
+                try:
+                    length = int(length_hdr)
+                except ValueError:
+                    self._send(400, {"error": "invalid Content-Length"})
+                    return
+                if length < 0 or length > 262144:
+                    self._send(400, {"error": "request body size is invalid"})
+                    return
+                body = self.rfile.read(length) if length > 0 else b""
+            if is_signed:
+                try:
+                    # The signature covers the full request-URI (path+query), so
+                    # a tampered query string cannot be replayed under the same
+                    # signature.
+                    signer = self._verify_signature(body, self.path)
+                except MeshError as exc:
+                    self._send(401, {"error": str(exc)})
+                    return
+                except BoardError as exc:
+                    self._send(401, {"error": str(exc)})
+                    return
+            else:
+                supplied = self.headers.get("Authorization", "")
+                if not hmac.compare_digest(supplied, f"Bearer {hub.token}"):
+                    self._send(401, {"error": "unauthorized"})
+                    return
+                signer = None
             try:
                 data = None
-                if self.command == "POST":
-                    length = int(self.headers.get("Content-Length", "0"))
-                    if length < 2 or length > 65536:
+                if self.command == "POST" and body:
+                    if len(body) < 2:
                         raise MeshError("request body size is invalid")
-                    data = json.loads(self.rfile.read(length))
+                    data = json.loads(body)
                     if not isinstance(data, dict):
                         raise MeshError("request body must be an object")
-                self._send(200, self._dispatch(data))
-            except (MeshError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+                self._send(200, self._dispatch(data, signer=signer))
+            except (MeshError, BoardError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
                 self._send(400, {"error": str(exc)})
 
         do_GET = _handle
@@ -814,6 +1089,110 @@ def _args() -> argparse.ArgumentParser:
     node_knowledge.add_argument("--leader", default=os.environ.get("EVILKIT_MESH_LEADER"))
     node_knowledge.add_argument("--token-file", type=Path, default=Path(os.environ.get("EVILKIT_MESH_TOKEN_FILE", ".evilkit-mesh/token")))
 
+    # --- orchestration (phase 3) subcommands ---
+    def _add_leader_args(p: argparse.ArgumentParser) -> None:
+        p.add_argument("--leader", default=os.environ.get("EVILKIT_MESH_LEADER"))
+        p.add_argument(
+            "--token-file", type=Path,
+            default=Path(os.environ.get("EVILKIT_MESH_TOKEN_FILE", ".evilkit-mesh/token")),
+        )
+
+    def _add_instance_args(p: argparse.ArgumentParser) -> None:
+        p.add_argument("--name", default=os.environ.get("EVILKIT_MESH_INSTANCE_NAME"),
+                       help="this instance's name on the hub")
+        p.add_argument("--key-file", type=Path,
+                       default=Path(os.environ.get("EVILKIT_MESH_INSTANCE_KEY", "")) if os.environ.get("EVILKIT_MESH_INSTANCE_KEY") else None,
+                       help="path to this instance's 32-byte ed25519 secret key")
+
+    instance = sub.add_parser("instance", help="run this host as an orchestration peer")
+    _add_leader_args(instance)
+    _add_instance_args(instance)
+    instance.add_argument("--role", default="")
+    instance.add_argument("--capability", action="append", default=[])
+    instance.add_argument("--position", action="append", default=[])
+    instance.add_argument("--channel", action="append", default=[])
+    instance.add_argument("--spool", type=Path, default=None,
+                          help="local inbox spool directory (default under XDG_STATE_HOME)")
+    instance.add_argument("--once", action="store_true", help="register, pull once, then exit")
+
+    keygen = sub.add_parser("keygen", help="generate an ed25519 instance keypair")
+    keygen.add_argument("--key-file", type=Path, required=True,
+                        help="where to write the 32-byte secret key (0600)")
+    keygen.add_argument("--pubkey-file", type=Path,
+                        help="where to write the 32-byte public key (default: KEY_FILE.pub)")
+
+    enroll = sub.add_parser("enroll", help="operator: enroll an instance pubkey on the hub")
+    _add_leader_args(enroll)
+    enroll.add_argument("instance_name", help="instance name to enroll")
+    enroll.add_argument("--pubkey-file", type=Path, required=True,
+                        help="path to the instance's 32-byte public key")
+    enroll.add_argument("--role", default="")
+
+    revoke = sub.add_parser("revoke", help="operator: revoke an instance's enrollment")
+    _add_leader_args(revoke)
+    revoke.add_argument("instance_name")
+
+    send = sub.add_parser("send", help="peer: send a directed message to another instance")
+    _add_leader_args(send)
+    _add_instance_args(send)
+    send.add_argument("--to", required=True)
+    send.add_argument("--subject", required=True)
+    send.add_argument("--body", required=True, help="message body (text; JSON is auto-detected)")
+    send.add_argument("--reply-to", default=None)
+    send.add_argument("--ttl", type=int, default=None)
+    send.add_argument("--secret", action="store_true",
+                      help="flag the message as credential-sensitive")
+
+    broadcast = sub.add_parser("broadcast", help="peer: publish to a channel")
+    _add_leader_args(broadcast)
+    _add_instance_args(broadcast)
+    broadcast.add_argument("--channel", required=True)
+    broadcast.add_argument("--subject", default="")
+    broadcast.add_argument("--body", required=True)
+    broadcast.add_argument("--ttl", type=int, default=None)
+    broadcast.add_argument("--secret", action="store_true")
+
+    inbox = sub.add_parser("inbox", help="peer: pull your inbox")
+    _add_leader_args(inbox)
+    _add_instance_args(inbox)
+    inbox.add_argument("--after", type=int, default=0)
+    inbox.add_argument("--ack", action="store_true", help="ack all pulled messages")
+
+    peers = sub.add_parser("peers", help="peer: list enrolled instances")
+    _add_leader_args(peers)
+    _add_instance_args(peers)
+    peers.add_argument("--reaching", help="filter to peers whose position covers this host")
+
+    claim = sub.add_parser("claim", help="peer: claim an asset")
+    _add_leader_args(claim)
+    _add_instance_args(claim)
+    claim.add_argument("asset")
+    claim.add_argument("--ttl", type=int, default=1800)
+
+    release = sub.add_parser("release", help="peer: release a claim")
+    _add_leader_args(release)
+    _add_instance_args(release)
+    release.add_argument("asset")
+
+    claims = sub.add_parser("claims", help="peer: list live claims")
+    _add_leader_args(claims)
+    _add_instance_args(claims)
+
+    objective = sub.add_parser("objective", help="peer: upsert an objective")
+    _add_leader_args(objective)
+    _add_instance_args(objective)
+    objective.add_argument("--id", default=None)
+    objective.add_argument("--title", required=True)
+    objective.add_argument("--status", required=True,
+                           choices=sorted(orchestration.OBJECTIVE_STATUSES))
+    objective.add_argument("--owner", default=None)
+    objective.add_argument("--requires", action="append", default=[])
+    objective.add_argument("--evidence", default="")
+
+    objectives = sub.add_parser("objectives", help="peer: list the objective board")
+    _add_leader_args(objectives)
+    _add_instance_args(objectives)
+
     display = sub.add_parser(
         "display",
         help="show a clone's live terminal (attack segment only)",
@@ -995,6 +1374,105 @@ def _start_display_watcher(config, *, hub_address: str | None, token_file: Path,
         flush=True,
     )
     return watcher
+
+
+def _resolve_instance_identity(args) -> tuple[str, bytes, bytes]:
+    name = args.name or os.environ.get("EVILKIT_MESH_INSTANCE_NAME", "")
+    key_file = args.key_file
+    if key_file is None:
+        env_key = os.environ.get("EVILKIT_MESH_INSTANCE_KEY", "")
+        if env_key:
+            key_file = Path(env_key)
+    if not name:
+        raise MeshError("instance name required: pass --name or set EVILKIT_MESH_INSTANCE_NAME")
+    if key_file is None:
+        raise MeshError("instance key required: pass --key-file or set EVILKIT_MESH_INSTANCE_KEY")
+    sk = _ed25519.load_sk(key_file)
+    pk = _ed25519.public_key(sk)
+    return name, sk, pk
+
+
+def _instance_body_from_arg(raw: str):
+    """Try JSON first; fall back to a text string."""
+    try:
+        return json.loads(raw)
+    except (ValueError, TypeError):
+        return raw
+
+
+def _run_orchestration_cli(args, argv) -> int:
+    if not args.leader:
+        args.leader = _read_connection(args.token_file)
+    if not args.leader:
+        raise MeshError("pass --leader or set EVILKIT_MESH_LEADER")
+    base = _url(args.leader)
+    if args.action == "instance":
+        from .instance_daemon import InstanceDaemon, install_signal_handlers
+        name, sk, pk = _resolve_instance_identity(args)
+        spool = args.spool or (_default_journal_dir() / "instances" / name)
+        daemon = InstanceDaemon(
+            name=name, leader=base, sk=sk, pk=pk, spool=Path(spool),
+            role=args.role, capabilities=args.capability or [],
+            position=args.position or [], channels=args.channel or [],
+        )
+        if args.once:
+            daemon.register()
+            daemon.subscribe_channels()
+            daemon.pull_inbox()
+            daemon.heartbeat()
+            daemon._write_status({"status": "once"})
+            print(json.dumps({"name": name, "spool": str(spool), "after": daemon._after}, indent=2))
+            return 0
+        install_signal_handlers(daemon)
+        print(f"mesh instance {name}: spool={spool}", flush=True)
+        return daemon.run()
+    name, sk, pk = _resolve_instance_identity(args)
+    if args.action == "send":
+        body = _instance_body_from_arg(args.body)
+        res = _signed_request(base, name=name, sk=sk, pk=pk, method="POST", path="/msg",
+                              data={"to": args.to, "subject": args.subject, "body": body,
+                                    "reply_to": args.reply_to, "ttl": args.ttl,
+                                    "secret": bool(args.secret)})
+        print(json.dumps(res, indent=2))
+    elif args.action == "broadcast":
+        body = _instance_body_from_arg(args.body)
+        res = _signed_request(base, name=name, sk=sk, pk=pk, method="POST", path="/channel/publish",
+                              data={"channel": args.channel, "subject": args.subject,
+                                    "body": body, "ttl": args.ttl, "secret": bool(args.secret)})
+        print(json.dumps(res, indent=2))
+    elif args.action == "inbox":
+        res = _signed_request(base, name=name, sk=sk, pk=pk, method="GET",
+                              path=f"/inbox?after={args.after}")
+        print(json.dumps(res, indent=2))
+        if args.ack and res.get("messages"):
+            ids = [m["id"] for m in res["messages"]]
+            _signed_request(base, name=name, sk=sk, pk=pk, method="POST", path="/msg/ack",
+                            data={"ids": ids})
+    elif args.action == "peers":
+        path = "/peers" if not args.reaching else "/peers?" + urllib.parse.urlencode({"reaching": args.reaching})
+        res = _signed_request(base, name=name, sk=sk, pk=pk, method="GET", path=path)
+        print(json.dumps(res, indent=2))
+    elif args.action == "claim":
+        res = _signed_request(base, name=name, sk=sk, pk=pk, method="POST", path="/claim",
+                              data={"asset": args.asset, "ttl": args.ttl})
+        print(json.dumps(res, indent=2))
+    elif args.action == "release":
+        res = _signed_request(base, name=name, sk=sk, pk=pk, method="POST", path="/claim/release",
+                              data={"asset": args.asset})
+        print(json.dumps(res, indent=2))
+    elif args.action == "claims":
+        res = _signed_request(base, name=name, sk=sk, pk=pk, method="GET", path="/claims")
+        print(json.dumps(res, indent=2))
+    elif args.action == "objective":
+        res = _signed_request(base, name=name, sk=sk, pk=pk, method="POST", path="/objective",
+                              data={"id": args.id, "title": args.title, "status": args.status,
+                                    "owner": args.owner, "requires": args.requires,
+                                    "evidence": args.evidence})
+        print(json.dumps(res, indent=2))
+    elif args.action == "objectives":
+        res = _signed_request(base, name=name, sk=sk, pk=pk, method="GET", path="/objectives")
+        print(json.dumps(res, indent=2))
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1261,6 +1739,21 @@ def main(argv: list[str] | None = None) -> int:
             # The windows are independent sessions (they hold the remote stream);
             # they stay open on exit so the operator keeps watching the clone.
             return 0
+        if args.action == "keygen":
+            # keygen needs no hub; short-circuit before the leader check.
+            sk, pk = _ed25519.keypair()
+            key_path = args.key_file.expanduser()
+            if key_path.exists():
+                raise MeshError(f"key file already exists: {key_path}")
+            _ed25519.save_sk(key_path, sk)
+            pub_path = (args.pubkey_file or Path(str(key_path) + ".pub")).expanduser()
+            pub_path.parent.mkdir(parents=True, exist_ok=True)
+            pub_path.write_bytes(pk)
+            pub_path.chmod(0o644)
+            print(f"secret: {key_path} (0600)")
+            print(f"public: {pub_path}")
+            print(f"pubkey_b64: {base64.b64encode(pk).decode('ascii')}")
+            return 0
         if not args.leader:
             args.leader = _read_connection(args.token_file)
         if not args.leader:
@@ -1396,6 +1889,33 @@ def main(argv: list[str] | None = None) -> int:
                 params["category"] = args.category
             items = _request(base, token, "/node/knowledge?" + urllib.parse.urlencode(params))
             print(json.dumps(items, indent=2))
+        elif args.action == "enroll":
+            if not args.leader:
+                args.leader = _read_connection(args.token_file)
+            if not args.leader:
+                raise MeshError("pass --leader or set EVILKIT_MESH_LEADER")
+            base = _url(args.leader)
+            token = _token(args.token_file)
+            pub = args.pubkey_file.expanduser().read_bytes()
+            if len(pub) != 32:
+                raise MeshError("pubkey file must be exactly 32 bytes")
+            result = _request(base, token, "/instance/enroll", {
+                "name": args.instance_name,
+                "pubkey": base64.b64encode(pub).decode("ascii"),
+                "role": args.role,
+            })
+            print(json.dumps(result, indent=2))
+        elif args.action == "revoke":
+            if not args.leader:
+                args.leader = _read_connection(args.token_file)
+            if not args.leader:
+                raise MeshError("pass --leader or set EVILKIT_MESH_LEADER")
+            base = _url(args.leader)
+            token = _token(args.token_file)
+            print(json.dumps(_request(base, token, "/instance/revoke", {"name": args.instance_name}), indent=2))
+        elif args.action in {"instance", "send", "broadcast", "inbox", "peers",
+                              "claim", "release", "claims", "objective", "objectives"}:
+            return _run_orchestration_cli(args, argv)
         return 0
     except (MeshError, BriefError, SegmentError, scope_mod.ScopeError, OSError) as exc:
         print(f"evilkit mesh: {exc}", file=sys.stderr)

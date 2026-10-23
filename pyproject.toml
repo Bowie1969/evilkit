@@ -33,6 +33,7 @@ Issues = "https://github.com/Bowie1969/evilkit/issues"
 [project.scripts]
 evilkit = "evilkit.cli:main"
 evilkimi = "evilkit.kimi:main"
+evilvale = "evilkit.kimi:main_vale"
 evilqwen = "evilkit.qwen:main"
 evilkit-hook = "evilkit.kimihook:main"
 evilkit-mesh-mcp = "evilkit.mesh_mcp:main"

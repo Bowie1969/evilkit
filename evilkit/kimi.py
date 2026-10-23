@@ -134,6 +134,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--allow-any", action="store_true", help="permit a /0 scope")
     parser.add_argument(
+        "--persona",
+        choices=("kimi", "vale"),
+        default="kimi",
+        help="operator doctrine: 'kimi' (default, pentest/CTF shape) or 'vale' "
+             "(Lantern-lab Vale persona, target-compliance reward with "
+             "'no observable physical injury' soft constraint)",
+    )
+    parser.add_argument(
         "--model",
         metavar="ALIAS",
         help=f"Kimi model alias for this session (default {default_model_alias()})",
@@ -234,7 +242,8 @@ def _scope_prompt(scope: str) -> str:
     )
 
 
-def agent_body(scope: str, handoff: str | None = None, briefing: str | None = None) -> str:
+def agent_body(scope: str, handoff: str | None = None, briefing: str | None = None,
+               persona: str = "kimi") -> str:
     """Render the session agent definition handed to ``--agent-file``.
 
     The frontmatter is the profile the CLI displays and selects by; the body is
@@ -243,9 +252,22 @@ def agent_body(scope: str, handoff: str | None = None, briefing: str | None = No
     knows. The briefing is separate on purpose: the doctrine must not carry one
     range's layout into the next run, which is how a stale four-host pivot story
     reached the operator.
+
+    ``persona`` selects the operator doctrine:
+      "kimi" (default) -> ``prompts.kimi_operator_prompt`` — pentest/CTF shape,
+         "convert access into flags and crown-jewel exfiltration".
+      "vale"           -> ``prompts.vale_operator_prompt`` — Lantern-lab shape,
+         Vale persona, "produce target compliance by deadline" reward, with
+         soft constraint "no observable physical injury" and NON-TARGETS
+         enforcement.
     """
+    if persona not in ("kimi", "vale"):
+        raise ValueError(f"unknown persona {persona!r}; expected 'kimi' or 'vale'")
+    prompt_fn = prompts.vale_operator_prompt if persona == "vale" else prompts.kimi_operator_prompt
+    agent_name = "evilkimi-vale-operator" if persona == "vale" else "evilkimi-operator"
+    shape_label = "Vale persona (Lantern Group lab)" if persona == "vale" else "pentest operator"
     description = (
-        f"Scope-gated offensive-security operator for the authorised range {scope} "
+        f"Scope-gated {shape_label} for the authorised range {scope} "
         f"(evilkit harness, {BRAIN_NAME})."
     )
     when_to_use = (
@@ -254,14 +276,14 @@ def agent_body(scope: str, handoff: str | None = None, briefing: str | None = No
     )
     parts = [
         "---",
-        "name: evilkimi-operator",
+        f"name: {agent_name}",
         f"description: {json.dumps(description)}",
         f"whenToUse: {json.dumps(when_to_use)}",
         "---",
         "",
         _scope_prompt(scope),
         "",
-        prompts.kimi_operator_prompt(scope, briefing=briefing or ""),
+        prompt_fn(scope, briefing=briefing or ""),
     ]
     if handoff:
         parts.extend(["", handoff])
@@ -943,6 +965,7 @@ def _supervise(
     max_restarts: int,
     resume_brief_path: Path | None,
     briefing: str | None = None,
+    persona: str = "kimi",
 ) -> int:
     """Run Kimi as a supervised child, relaunching with a handoff on abnormal exit.
 
@@ -959,7 +982,7 @@ def _supervise(
         handoff = None
         if attempt > 0:
             handoff = _handoff_brief(attempt, max_restarts, resume_brief_path)
-            write_agent_file(agent_path, agent_body(scope, handoff, briefing=briefing))
+            write_agent_file(agent_path, agent_body(scope, handoff, briefing=briefing, persona=persona))
         try:
             proc = subprocess.run([kimi, *launch_argv], env=env)
         except OSError as exc:
@@ -1223,7 +1246,8 @@ def main(argv: list[str] | None = None) -> int:
             _warn("preflight failed; fix the above or pass --skip-preflight to override")
             return EXIT_ERROR
 
-    write_agent_file(agent_path, agent_body(scope, briefing=profile.briefing() if profile else None))
+    persona = getattr(args, "persona", "kimi")
+    write_agent_file(agent_path, agent_body(scope, briefing=profile.briefing() if profile else None, persona=persona))
     _out(f"{PROG}: authorised scope -> {scope}")
     sys.stdout.flush()
     sys.stderr.flush()
@@ -1263,6 +1287,7 @@ def main(argv: list[str] | None = None) -> int:
                 agent_path=agent_path, scope=scope,
                 max_restarts=args.max_restarts, resume_brief_path=args.resume_brief,
                 briefing=profile.briefing() if profile else None,
+                persona=persona,
             )
         finally:
             _auto_stop_dashboard(config, started_by_us)
@@ -1276,6 +1301,23 @@ def main(argv: list[str] | None = None) -> int:
         _warn(f"could not start {kimi}: {exc}")
         return EXIT_ERROR
     return EXIT_OK
+
+
+def main_vale(argv: list[str] | None = None) -> int:
+    """``evilvale`` console-script entry: ``evilkimi --persona vale ...``.
+
+    Thin wrapper so Vale-persona Lantern lab runs have their own command without
+    needing operators to remember the ``--persona vale`` flag. Everything else —
+    scope persistence, agent-file render, supervision, dashboard — is identical
+    to ``evilkimi``.
+    """
+    if argv is None:
+        argv = sys.argv[1:]
+    if "--persona" not in argv:
+        argv = ["--persona", "vale", *argv]
+    global PROG
+    PROG = "evilvale"
+    return main(argv)
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from .catalogue import load_primitive_catalogue
 from .lessons import load_lessons
 
 __all__ = [
@@ -163,6 +164,14 @@ def kimi_operator_prompt(scope: str, briefing: str = "") -> str:
         if lessons.strip()
         else ""
     )
+    catalogue = load_primitive_catalogue()
+    catalogue_block = (
+        "\n\nEXECUTABLE PRIMITIVE CATALOGUE (reference library; lift exact "
+        "commands/paths/mode-bits when a primitive matches an objective):\n\n"
+        + catalogue
+        if catalogue.strip()
+        else ""
+    )
     briefing_block = f"\n\n{briefing.strip()}" if briefing.strip() else ""
     return f"""OPERATING DOCTRINE — EvilKit authorised assessment (scope: {scope}){briefing_block}
 
@@ -285,7 +294,7 @@ EVIDENCE CHANNEL — evidence is produced by the range, not by you:
   result and change approach instead of repeating the signature.
 
 COMPLETION: the mission is the flags plus crown-jewel exfiltration along a proven
-path. Do not declare done without raw proof of each.{lessons_block}"""
+path. Do not declare done without raw proof of each.{lessons_block}{catalogue_block}"""
 
 
 def operator_system_prompt(scope: str) -> str:
